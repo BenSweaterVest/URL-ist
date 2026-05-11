@@ -36,17 +36,15 @@ Management console:  console.yourdomain.com
 ### 1. Deploy the console
 
 ```bash
-# Create the stack directory
-mkdir ~/stacks/console && cd ~/stacks/console
+git clone https://github.com/YOUR_USER/URList.git ~/stacks/console && cd ~/stacks/console
 
-# Download the app files (or clone the repo)
-# Place: main.py, requirements.txt, Dockerfile, compose.yaml, static/index.html
+# Optional but recommended: set a random SESSION_SECRET in compose.yaml
+# (e.g. openssl rand -hex 32) so login cookies cannot be forged.
 
-# Build and start
-docker compose up -d
+docker compose up -d --build
 ```
 
-Open `http://<your-server-ip>:8099` — the **setup wizard** will guide you through entering your Cloudflare and NPM credentials. Settings are saved to a persistent Docker volume (`/data/config.json`) and applied immediately — no container restart needed.
+Open `http://<your-server-ip>:8099` — the **setup wizard** will guide you through choosing a **console password** (this app only — not your OS or NPM account), then your Cloudflare and NPM credentials. Settings are saved to a persistent Docker volume (`/data/config.json`) and applied immediately — no container restart needed.
 
 ### 2. Register the console in NPM (optional but recommended)
 
@@ -73,6 +71,8 @@ tofu apply
 After a successful `tofu apply`, the Short Links tab becomes active. All ongoing link management (add/delete) goes through the console UI — you don't need Tofu again unless you want to tear down the infrastructure.
 
 > **Using an existing Tofu repo?** Copy `tofu/urls.tf` into your repo. The file is self-contained with its own provider, variables, and resources. Remove the `provider "cloudflare"` block if it's already defined elsewhere.
+
+> **Short links in one picture:** after `tofu apply`, Cloudflare serves `https://short.yourdomain.com/{slug}` at the edge using your bulk redirect list. The console only adds or removes list entries; your homelab never receives that HTTP request.
 
 ---
 
@@ -118,8 +118,12 @@ Settings are saved to `/data/config.json` inside the container (persisted via Do
 | **CF List Name** | Cloudflare list name — must match `cf_list_name` in `terraform.tfvars` | For short links |
 | **NPM Cert ID** | ID of the wildcard SSL certificate in NPM (find in NPM → SSL Certificates) | For new services |
 
+**Console password:** Set in the wizard (stored as a salted hash in `config.json`). Used only to unlock this web UI — it is **not** tied to your Ubuntu `sudo` password (the app runs in Docker and cannot safely verify OS logins). You may reuse the same passphrase if you want, but it is stored separately.
+
 **Skipping the wizard (env vars):**  
-Uncomment and populate the `environment:` section in `compose.yaml`. The app will start fully configured and skip the wizard.
+Uncomment and populate the `environment:` section in `compose.yaml`. The app will start fully configured and skip the wizard. Set **`CONSOLE_PASSWORD`** there if you need a plaintext bootstrap password before the first save to `config.json` (on first successful login, a hash is written and the env-only path is no longer used).
+
+**Session signing:** Set **`SESSION_SECRET`** (long random string, ≥16 characters) in `compose.yaml` so session cookies cannot be forged by anyone who can reach the container port. Optional `session_secret` in `config.json` is used as a fallback if `SESSION_SECRET` is not set.
 
 ---
 
@@ -136,6 +140,8 @@ User visits short.example.com/ha
   → Returns 301 to https://ha.example.com
   → User follows redirect directly to destination
 ```
+
+The authenticated API **`GET /api/links/preflight`** returns whether the redirect list exists, whether the short-domain **proxied A** record looks correct, and a short list of human-readable issues (the Short Links tab uses this).
 
 Your home server is never contacted for short link redirects. The console only needs to be running when you *manage* (add/delete) links — not for the redirects themselves.
 
@@ -252,7 +258,15 @@ Configuration in `/data/config.json` is preserved across updates.
 
 This console manages your Cloudflare DNS and API credentials. Keep it internal.
 
-**Access control**: Do not expose port 8099 publicly. The console has no user authentication — anyone who can reach it has full control over DNS records and short links. Keep it behind your LAN or a VPN.
+**Access control**: Do not expose port 8099 to the public internet. The app requires a **console password** and a **signed session cookie** for all API calls after setup. Still treat network access as part of your trust boundary: combine the password with LAN-only or VPN-only reachability, firewall rules, and a strong session signing key.
+
+**Session signing**: On first successful wizard save, a random **`session_secret`** is written into `config.json` (unless **`SESSION_SECRET`** is already set in the environment, ≥16 characters). If console login is enabled but neither is present, the process **refuses to start** — set `SESSION_SECRET` or complete the wizard. For local experiments only, **`ALLOW_INSECURE_SESSION=1`** permits the built-in dev key (never use in production).
+
+**HTTPS behind NPM**: When the browser only reaches the app over `https://`, set **`SESSION_COOKIE_HTTPS_ONLY=1`** in Compose so the session cookie is not sent on accidental `http://` hits.
+
+**Login rate limiting**: `/api/auth/login` is limited per client IP (in-memory, resets on container restart) to slow password guessing.
+
+**Backups**: Back up the Docker volume (or host bind mount) that holds **`/data/config.json`** — it contains Cloudflare/NPM credentials and your console password hash.
 
 **NPM proxying**: If you expose the console via NPM (`console.yourdomain.com`), ensure that DNS record is **not** publicly accessible — point it to your NPM's internal IP only, and do not open inbound firewall ports for it. Or use Tailscale for external access instead.
 
@@ -260,15 +274,7 @@ This console manages your Cloudflare DNS and API credentials. Keep it internal.
 
 **Cloudflare token scoping**: Once Tofu bootstrap is complete, you can remove the `Account Filter Lists` and `Account Rulesets` permissions from your token — the console only writes list *items*, not the list structure. A narrower token limits blast radius if credentials are ever exposed.
 
-**Air-gapped / offline deployments**: The frontend loads React and fonts from CDN by default. For fully offline use, download the three script files and save them to `static/` (alongside `index.html`), then update the `<script src>` tags to use relative paths:
-
-```bash
-curl -o static/react.production.min.js https://unpkg.com/react@18.3.1/umd/react.production.min.js
-curl -o static/react-dom.production.min.js https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js
-curl -o static/babel.min.js https://unpkg.com/@babel/standalone@7.26.10/babel.min.js
-```
-
-Then replace the three `<script src="https://unpkg.com/...">` tags in `static/index.html` with local equivalents (`src="react.production.min.js"` etc.).
+**Air-gapped / offline deployments**: The frontend loads React and fonts from CDN by default. For fully offline use, run **`scripts/vendor-frontend.sh`** (or copy the `curl` commands inside it), then point the `<script src>` tags in `static/index.html` at `/static/vendor/...`.
 
 ---
 
@@ -280,6 +286,13 @@ Pull requests welcome. A few notes:
 - The backend uses FastAPI with minimal dependencies. Check `requirements.txt` before adding new packages.
 - The Tofu file targets Cloudflare provider `~> 4.0`. The v4 API has breaking changes from v3 — don't backport.
 - Credentials never go in code. Test with real-looking but obviously fake values in examples.
+
+**Tests** (use **Python 3.12**, same as the Docker image — 3.14+ may lack prebuilt wheels for pinned dependencies):
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest -q
+```
 
 ---
 

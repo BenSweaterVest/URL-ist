@@ -5,8 +5,8 @@
 #
 # ── First-run setup (no pre-configuration needed) ──────────────────────────
 # Deploy the stack, then open http://<your-server-ip>:8099 in your browser.
-# The setup wizard will prompt for Cloudflare and NPM credentials, test them,
-# and save them to /data/config.json (persisted by the volume below).
+# The setup wizard will prompt for a console password, then Cloudflare and NPM
+# credentials, test them, and save them to /data/config.json (persisted by the volume).
 #
 # After the wizard completes:
 #   1. Use the Services tab to register the console itself:
@@ -40,8 +40,17 @@ services:
     volumes:
       - urlconsole_data:/data   # persists config.json across container restarts
 
+    # Uncomment ONE environment block below. For production, set SESSION_SECRET
+    # (e.g. openssl rand -hex 32) so login cookies cannot be forged.
+    #
+    # environment:
+    #   SESSION_SECRET: "paste-a-long-random-string-here"
+    #
     # Uncomment to skip the setup wizard and pre-configure via environment:
     # environment:
+    #   SESSION_SECRET: ""         # recommended — see README
+    #   SESSION_COOKIE_HTTPS_ONLY: "1"   # when users only reach the UI over https://
+    #   ALLOW_INSECURE_SESSION: "1"     # dev only — weak session signing if no secret
     #   CF_API_TOKEN:  ""          # required
     #   CF_ACCOUNT_ID: ""          # required
     #   CF_ZONE_ID:    ""          # required
@@ -52,6 +61,7 @@ services:
     #   SHORT_DOMAIN:  "short.example.com"        # subdomain for short links
     #   CF_LIST_NAME:  "shortlinks"               # must be alphanumeric + underscores
     #   NPM_CERT_ID:   "2"         # wildcard cert ID in NPM
+    #   CONSOLE_PASSWORD: ""       # optional plaintext console login when using env-only bootstrap
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]

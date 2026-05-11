@@ -30,7 +30,13 @@ Optional fields (env var names shown, built-in defaults listed):
   SHORT_DOMAIN    Full short-link domain  e.g. short.example.com  (default: "")
   CF_LIST_NAME    Cloudflare list name — must match Tofu bootstrap  (shortlinks)
   NPM_CERT_ID     Wildcard SSL cert ID in NPM                      (2)
-  CONFIG_FILE     Override path to config JSON           (/data/config.json)
+  CONFIG_FILE      Override path to config JSON           (/data/config.json)
+  SESSION_SECRET   Key for signing login session cookies (>=16 chars). Optional if
+                   session_secret is stored in config.json (auto-generated on first save).
+  CONSOLE_PASSWORD Plaintext console password for env-only bootstrap; first login
+                   persists a hash to config.json (see README).
+  SESSION_COOKIE_HTTPS_ONLY  If 1/true, session cookies are not sent over plain HTTP.
+  ALLOW_INSECURE_SESSION     If 1/true, allow startup with weak session signing (dev only).
 
 Manages three resource types:
   Links      Cloudflare Bulk Redirect list items (SHORT_DOMAIN/*)
@@ -39,11 +45,14 @@ Manages three resource types:
 """
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
+import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -56,12 +65,143 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
+from starlette.middleware.sessions import SessionMiddleware
 
 logger = logging.getLogger("console")
+
+__version__ = "1.0.1"
 
 CF_BASE     = "https://api.cloudflare.com/client/v4"
 MASK_CHAR   = "•"   # used to mask secrets in GET /api/config responses
 CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", "/data/config.json"))
+
+_DEV_SESSION_FALLBACK = "urlist-dev-session-secret-not-for-production-use"
+
+# Login brute-force mitigation (per client IP, in-process — reset on restart).
+_LOGIN_RATE_WINDOW_SEC = 60.0
+_LOGIN_RATE_MAX        = 12
+_login_attempts: dict[str, list[float]] = {}
+
+# When set, logins are verified against this env var until a hash is stored in
+# config.json (first successful login persists the hash and clears this path).
+_console_password_env: str | None = None
+
+
+def _hash_console_password(password: str) -> str:
+    """Return a salted scrypt string for storage in config.json (never store plaintext)."""
+    salt = secrets.token_bytes(16)
+    key = hashlib.scrypt(
+        password.encode(),
+        salt=salt,
+        n=2**14,
+        r=8,
+        p=1,
+        dklen=32,
+    )
+    return f"scrypt:{salt.hex()}:{key.hex()}"
+
+
+def _verify_console_password(password: str, stored: str) -> bool:
+    """Constant-time verify for scrypt hashes produced by _hash_console_password."""
+    if not stored.startswith("scrypt:"):
+        return False
+    try:
+        _, salt_hex, key_hex = stored.split(":", 2)
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(key_hex)
+        key = hashlib.scrypt(
+            password.encode(),
+            salt=salt,
+            n=2**14,
+            r=8,
+            p=1,
+            dklen=32,
+        )
+        return secrets.compare_digest(key, expected)
+    except (ValueError, OSError):
+        return False
+
+
+def _session_secret_sources() -> tuple[str, str]:
+    """Return (secret, source) where source is 'env', 'file', or 'fallback'."""
+    env = os.environ.get("SESSION_SECRET", "").strip()
+    if len(env) >= 16:
+        return env, "env"
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text())
+            fs = str(data.get("session_secret", "")).strip()
+            if len(fs) >= 16:
+                return fs, "file"
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+    return _DEV_SESSION_FALLBACK, "fallback"
+
+
+def _session_secret() -> str:
+    """Secret for SessionMiddleware — env first, then optional key in config.json."""
+    secret, source = _session_secret_sources()
+    if source == "fallback":
+        logger.warning(
+            "SESSION_SECRET is not set (or too short) and no session_secret in config.json — "
+            "using a built-in development key. Set SESSION_SECRET or persist session_secret."
+        )
+    return secret
+
+
+def _session_signing_is_secure() -> bool:
+    """True when not using the baked-in development session key."""
+    return _session_secret_sources()[1] != "fallback"
+
+
+def _ensure_session_secret_in_config(config_data: dict[str, Any], prior: dict[str, Any]) -> None:
+    """If no strong secret exists in env, file (prior), or payload, generate one for disk."""
+    if len(os.environ.get("SESSION_SECRET", "").strip()) >= 16:
+        return
+    ss = str(config_data.get("session_secret", "")).strip()
+    if len(ss) >= 16:
+        return
+    prev = str(prior.get("session_secret", "")).strip()
+    if len(prev) >= 16:
+        config_data["session_secret"] = prev
+        return
+    config_data["session_secret"] = secrets.token_hex(32)
+    logger.info("Generated session_secret and persisted it to config (first-time setup)")
+
+
+def _session_cookie_https_only() -> bool:
+    return os.environ.get("SESSION_COOKIE_HTTPS_ONLY", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _record_login_attempt(client_ip: str) -> None:
+    """Raise 429 when too many login attempts from this IP in the sliding window."""
+    now = time.monotonic()
+    bucket = _login_attempts.setdefault(client_ip, [])
+    bucket[:] = [t for t in bucket if now - t < _LOGIN_RATE_WINDOW_SEC]
+    if len(bucket) >= _LOGIN_RATE_MAX:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many login attempts — try again in a minute.",
+        )
+    bucket.append(now)
+
+
+def _login_required() -> bool:
+    """True when the console should require a successful /api/auth/login session."""
+    if not config.is_configured():
+        return False
+    return bool(config.console_password_hash or _console_password_env)
+
+
+def _session_authenticated(request: Request) -> bool:
+    if not _login_required():
+        return True
+    return bool(request.session.get("authenticated"))
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -80,6 +220,7 @@ class Config:
     domain:        str = ""
     short_domain:  str = ""
     cf_list_name:  str = "shortlinks"
+    console_password_hash: str = ""
 
     # ── Derived properties ────────────────────────────────────────────────────
 
@@ -148,12 +289,13 @@ def _load_config() -> None:
     Called once at startup and again after the wizard saves new settings.
     Clears all API caches so stale tokens/IDs from previous credentials are dropped.
     """
-    global config, _list_id_cache, _npm_token, _npm_token_expires
+    global config, _list_id_cache, _npm_token, _npm_token_expires, _console_password_env
 
     # Reset caches — credentials may have changed
     _list_id_cache    = None
     _npm_token        = None
     _npm_token_expires = 0.0
+    _console_password_env = None
 
     file_data: dict[str, Any] = {}
     if CONFIG_FILE.exists():
@@ -188,7 +330,13 @@ def _load_config() -> None:
         domain        = _get("domain",       ""),
         short_domain  = _get("short_domain", ""),
         cf_list_name  = _get("cf_list_name", "shortlinks"),
+        console_password_hash = _get("console_password_hash", ""),
     )
+
+    if not config.console_password_hash:
+        env_pw = os.environ.get("CONSOLE_PASSWORD", "").strip()
+        if env_pw:
+            _console_password_env = env_pw
 
 
 def _mask(value: str) -> str:
@@ -229,6 +377,21 @@ async def lifespan(app: FastAPI):
     """Load config, log startup state, verify Cloudflare if configured."""
     _load_config()
     logger.info("PenguinNest Console starting")
+    if _login_required() and not _session_signing_is_secure():
+        allow = os.environ.get("ALLOW_INSECURE_SESSION", "").strip().lower() in ("1", "true", "yes", "on")
+        if allow:
+            logger.critical(
+                "ALLOW_INSECURE_SESSION is enabled — session cookies use a weak signing key. "
+                "Remove this flag for production."
+            )
+        else:
+            logger.critical(
+                "Console login is enabled but session signing is not configured securely. "
+                "Set SESSION_SECRET (>=16 chars) in the environment, add session_secret to "
+                "config.json (saved automatically on first wizard save), or set "
+                "ALLOW_INSECURE_SESSION=1 only for local development."
+            )
+            sys.exit(1)
     if config.is_configured():
         logger.info(f"  Domain:       {config.domain}")
         logger.info(f"  Short domain: {config.short_domain}")
@@ -250,32 +413,50 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="PenguinNest Console", lifespan=lifespan)
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=_session_secret(),
+    max_age=14 * 24 * 3600,
+    same_site="lax",
+    https_only=_session_cookie_https_only(),
+)
 
 
 # ── Middleware ────────────────────────────────────────────────────────────────
 
 @app.middleware("http")
-async def require_configured(request: Request, call_next):
-    """Block functional API endpoints when the app has not been configured yet.
+async def security_gate(request: Request, call_next):
+    """Enforce setup wizard gating and signed-cookie authentication for API calls.
 
-    Always allows:
-      /api/health          — Docker healthcheck must work before setup
-      /api/config*         — wizard reads and writes config
-      Everything non-/api  — static files and the SPA itself
+    Non-API routes (SPA + /static) are always served.  /api/health stays open for
+    Docker healthchecks.  /api/auth/* is open so the login page can call status/login.
+
+    Unconfigured installs: only /api/config* works (wizard).  After configuration,
+    /api/config* and all other functional APIs require a valid session unless no
+    console password is configured (legacy / migration only).
     """
     path = request.url.path
-    if (
-        not path.startswith("/api/")
-        or path == "/api/health"
-        or path.startswith("/api/config")
-    ):
+
+    if not path.startswith("/api/"):
+        return await call_next(request)
+
+    if path == "/api/health" or path.startswith("/api/auth/"):
         return await call_next(request)
 
     if not config.is_configured():
+        if path.startswith("/api/config"):
+            return await call_next(request)
         return JSONResponse(
             status_code=503,
             content={"detail": "Application not configured. Complete the setup wizard first."},
         )
+
+    if not _session_authenticated(request):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Not authenticated"},
+        )
+
     return await call_next(request)
 
 
@@ -419,9 +600,92 @@ async def health():
     return {
         "status":     "ok",
         "service":    "console",
-        "version":    "1.0.0",
+        "version":    __version__,
         "configured": config.is_configured(),
     }
+
+
+# ── Authentication (session cookie) ─────────────────────────────────────────────
+
+class LoginBody(BaseModel):
+    password: str
+
+
+@app.get("/api/auth/status")
+async def auth_status(request: Request):
+    """Return bootstrap and login state for the SPA (no authentication required)."""
+    return {
+        "configured":      config.is_configured(),
+        "missing_fields": config.missing_fields(),
+        "authenticated":  bool(request.session.get("authenticated")),
+        "login_required": _login_required(),
+    }
+
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request, body: LoginBody):
+    """Validate the console password and start a signed session."""
+    if not config.is_configured():
+        raise HTTPException(status_code=400, detail="Application is not configured yet")
+
+    client_ip = request.client.host if request.client else "unknown"
+    _record_login_attempt(client_ip)
+
+    ok = False
+    global _console_password_env
+
+    if config.console_password_hash:
+        ok = _verify_console_password(body.password, config.console_password_hash)
+    elif _console_password_env is not None:
+        ok = secrets.compare_digest(body.password, _console_password_env)
+        if ok:
+            new_hash = _hash_console_password(body.password)
+            snapshot: dict[str, Any] = {
+                "cf_api_token":          config.cf_api_token,
+                "cf_account_id":         config.cf_account_id,
+                "cf_zone_id":            config.cf_zone_id,
+                "npm_url":               config.npm_url,
+                "npm_email":             config.npm_email,
+                "npm_password":          config.npm_password,
+                "npm_cert_id":           config.npm_cert_id,
+                "domain":                config.domain,
+                "short_domain":          config.short_domain,
+                "cf_list_name":          config.cf_list_name,
+                "console_password_hash": new_hash,
+            }
+            prior_snap: dict[str, Any] = {}
+            if CONFIG_FILE.exists():
+                try:
+                    prior_snap = json.loads(CONFIG_FILE.read_text())
+                    ss = str(prior_snap.get("session_secret", "")).strip()
+                    if len(ss) >= 16:
+                        snapshot["session_secret"] = ss
+                except (OSError, json.JSONDecodeError, TypeError):
+                    prior_snap = {}
+            _ensure_session_secret_in_config(snapshot, prior_snap)
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(json.dumps(snapshot, indent=2))
+            CONFIG_FILE.chmod(0o600)
+            _console_password_env = None
+            _load_config()
+    else:
+        raise HTTPException(
+            status_code=503,
+            detail="No console password is configured — complete the setup wizard",
+        )
+
+    if not ok:
+        raise HTTPException(status_code=401, detail="Invalid password")
+
+    request.session["authenticated"] = True
+    return {"success": True}
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request):
+    """Clear the session cookie."""
+    request.session.clear()
+    return {"success": True}
 
 
 # ── Configuration endpoints ───────────────────────────────────────────────────
@@ -462,6 +726,7 @@ async def get_config():
         "domain":         config.domain,
         "short_domain":   config.short_domain,
         "cf_list_name":   config.cf_list_name,
+        "console_password_set": bool(config.console_password_hash or _console_password_env),
     }
 
 
@@ -488,6 +753,8 @@ class ConfigProposal(BaseModel):
     domain:        str = ""
     short_domain:  str = ""
     cf_list_name:  str = "shortlinks"
+    console_password:         str = ""
+    console_password_confirm: str = ""
 
     @field_validator("npm_cert_id")
     @classmethod
@@ -584,6 +851,33 @@ async def save_config(proposal: ConfigProposal):
     without the user modifying a pre-filled masked field.
     Always accessible regardless of configuration state.
     """
+    prior: dict[str, Any] = {}
+    if CONFIG_FILE.exists():
+        try:
+            prior = json.loads(CONFIG_FILE.read_text())
+        except (OSError, json.JSONDecodeError, TypeError):
+            prior = {}
+
+    prev_hash = str(prior.get("console_password_hash", "")).strip()
+    new_pw    = proposal.console_password.strip()
+    final_hash = prev_hash
+
+    if new_pw:
+        if new_pw != proposal.console_password_confirm.strip():
+            raise HTTPException(status_code=400, detail="Console passwords do not match")
+        if len(new_pw) < 8:
+            raise HTTPException(
+                status_code=400,
+                detail="Console password must be at least 8 characters",
+            )
+        final_hash = _hash_console_password(new_pw)
+
+    if not final_hash and _console_password_env is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Console password is required (set it in the wizard, or use CONSOLE_PASSWORD in the environment)",
+        )
+
     config_data = {
         "cf_api_token":  _resolve(proposal.cf_api_token,  config.cf_api_token),
         "cf_account_id": proposal.cf_account_id,
@@ -595,7 +889,15 @@ async def save_config(proposal: ConfigProposal):
         "domain":        proposal.domain,
         "short_domain":  proposal.short_domain,
         "cf_list_name":  proposal.cf_list_name,
+        "console_password_hash": final_hash,
     }
+
+    if final_hash:
+        _ensure_session_secret_in_config(config_data, prior)
+    else:
+        ss = str(prior.get("session_secret", "")).strip()
+        if len(ss) >= 16:
+            config_data["session_secret"] = ss
 
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -632,6 +934,80 @@ async def list_links():
         params={"per_page": 500},
     )
     return {"items": data.get("result", []), "list_exists": True}
+
+
+@app.get("/api/links/preflight")
+async def short_links_preflight():
+    """Check short-link readiness: bulk redirect list + short-domain DNS (proxied A).
+
+    Intended for the Short Links tab and for operators scripting checks. Does not
+    validate account-level ruleset presence (requires extra API scope); Tofu
+    bootstrap remains the source of truth for ruleset + list creation.
+    """
+    list_id = await get_list_id()
+    dns_block: dict[str, Any] = {
+        "checked": False,
+        "found":     False,
+        "proxied":   None,
+        "name":      (config.short_domain or "").strip().lower(),
+        "hint":      None,
+    }
+    name = dns_block["name"]
+    if name:
+        dns_block["checked"] = True
+        try:
+            data = await cf_request(
+                "GET",
+                f"/zones/{config.cf_zone_id}/dns_records",
+                params={"name": name, "type": "A", "per_page": 10},
+            )
+            results = data.get("result", [])
+            if results:
+                rec = results[0]
+                dns_block["found"]   = True
+                dns_block["proxied"] = rec.get("proxied")
+                dns_block["name"]    = rec.get("name", name)
+                if rec.get("proxied") is False:
+                    dns_block["hint"] = (
+                        "This A record should be proxied (orange cloud) so Cloudflare "
+                        "can intercept requests and apply bulk redirects at the edge."
+                    )
+            else:
+                dns_block["hint"] = (
+                    "No A record for this hostname in the zone — run Tofu bootstrap "
+                    "or add a proxied A record for the short domain."
+                )
+        except HTTPException as e:
+            dns_block["hint"] = str(e.detail)
+
+    issues: list[str] = []
+    if not list_id:
+        issues.append(
+            "Bulk redirect list not found — run once: cd tofu && tofu init && tofu apply",
+        )
+    if not config.short_domain:
+        issues.append("Short Links Domain is not set — open Settings and set it to e.g. short.example.com.")
+    elif dns_block["checked"] and not dns_block["found"]:
+        issues.append(f"No A record in this zone for {name}.")
+    elif dns_block["checked"] and dns_block["found"] and dns_block.get("proxied") is False:
+        issues.append("Short domain exists but is DNS-only (grey cloud) — enable proxying.")
+
+    ready = bool(
+        list_id
+        and config.short_domain
+        and dns_block["checked"]
+        and dns_block["found"]
+        and dns_block.get("proxied") is True,
+    )
+
+    return {
+        "list_exists":   bool(list_id),
+        "cf_list_name":  config.cf_list_name,
+        "short_domain":  config.short_domain,
+        "dns":           dns_block,
+        "ready":         ready,
+        "issues":        issues,
+    }
 
 
 class LinkCreate(BaseModel):

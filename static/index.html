@@ -185,6 +185,7 @@ const api = async (method, path, body) => {
   try {
     r = await fetch(path, {
       method,
+      credentials: 'same-origin',
       headers: body ? { 'Content-Type': 'application/json' } : {},
       body:    body ? JSON.stringify(body) : undefined,
     });
@@ -266,9 +267,29 @@ function TestResults({ results }) {
 
 // ── Config form fields (shared by wizard and settings modal) ──────────────────
 
-function ConfigForm({ form, setField }) {
+function ConfigForm({ form, setField, consolePasswordOptional }) {
   return (
     <>
+      {/* Console login (wizard: required; settings: optional change) */}
+      <div className="wizard-section">
+        <div className="wizard-section-title">Console access</div>
+        <div className="field">
+          <label>Console password</label>
+          <input type="password" placeholder={consolePasswordOptional ? 'Leave blank to keep current' : 'At least 8 characters'} value={form.console_password || ''}
+            onChange={e => setField('console_password', e.target.value)} />
+          <div className="field-hint">
+            {consolePasswordOptional
+              ? 'Leave both fields blank to keep your current password. To change it, enter a new password (8+ characters) twice.'
+              : 'Protects this app only. Use a strong password unique to the console — not your Ubuntu, NPM, or Cloudflare password.'}
+          </div>
+        </div>
+        <div className="field">
+          <label>Confirm password</label>
+          <input type="password" placeholder={consolePasswordOptional ? 'Leave blank if unchanged' : 'Repeat password'} value={form.console_password_confirm || ''}
+            onChange={e => setField('console_password_confirm', e.target.value)} />
+        </div>
+      </div>
+
       {/* Cloudflare */}
       <div className="wizard-section">
         <div className="wizard-section-title">Cloudflare</div>
@@ -357,11 +378,58 @@ function ConfigForm({ form, setField }) {
 }
 
 
+// ── Login (session cookie) ──────────────────────────────────────────────────
+
+function LoginScreen({ onAuthed, toast }) {
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const submit = async () => {
+    if (!password) return;
+    setBusy(true);
+    try {
+      await api('POST', '/api/auth/login', { password });
+      onAuthed();
+    } catch (e) {
+      toast(e.message, 'err');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="wizard-wrap">
+      <div className="wizard" style={{ maxWidth: '420px' }}>
+        <div className="wizard-brand">
+          <span className="wizard-brand-icon">🐧</span>
+          <div>
+            <div className="wizard-brand-title">PENGUINNEST CONSOLE</div>
+            <div className="wizard-brand-sub">Sign in to continue</div>
+          </div>
+        </div>
+        <div className="field">
+          <label>Console password</label>
+          <input type="password" autoFocus value={password}
+            onChange={e => setPassword(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && submit()} />
+        </div>
+        <div className="wizard-footer" style={{ borderTop: 'none', paddingTop: 0 }}>
+          <button className="btn btn-primary" onClick={submit} disabled={busy || !password}>
+            {busy ? 'Signing in…' : 'Sign in'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 // ── Setup Wizard ──────────────────────────────────────────────────────────────
 // Shown on first launch when no configuration exists.
 // Full-page (not a closeable modal) — the app is non-functional until configured.
 
 const WIZARD_DEFAULTS = {
+  console_password: '', console_password_confirm: '',
   cf_api_token: '', cf_account_id: '', cf_zone_id: '',
   npm_url: '', npm_email: '', npm_password: '',
   npm_cert_id: 2, domain: '',
@@ -378,7 +446,9 @@ function WizardScreen({ onComplete, toast }) {
 
   const requiredFilled = form.cf_api_token && form.cf_account_id && form.cf_zone_id
                       && form.npm_email && form.npm_password
-                      && form.domain && form.npm_url;
+                      && form.domain && form.npm_url
+                      && form.console_password && form.console_password.length >= 8
+                      && form.console_password === form.console_password_confirm;
 
   const test = async () => {
     setTesting(true);
@@ -397,6 +467,7 @@ function WizardScreen({ onComplete, toast }) {
     setSaving(true);
     try {
       await api('POST', '/api/config', form);
+      await api('POST', '/api/auth/login', { password: form.console_password });
       toast('Configuration saved — welcome to PenguinNest Console!', 'ok');
       onComplete();
     } catch (e) {
@@ -417,7 +488,7 @@ function WizardScreen({ onComplete, toast }) {
           </div>
         </div>
 
-        <ConfigForm form={form} setField={setField} />
+        <ConfigForm form={form} setField={setField} consolePasswordOptional={false} />
 
         {/* Test results appear after clicking "Test Connections" */}
         <TestResults results={testResults} />
@@ -458,7 +529,7 @@ function SettingsModal({ onClose, toast }) {
 
   useEffect(() => {
     api('GET', '/api/config').then(data => {
-      setForm(data);
+      setForm({ ...data, console_password: '', console_password_confirm: '' });
     }).catch(e => {
       toast(e.message, 'err');
       onClose();
@@ -501,7 +572,7 @@ function SettingsModal({ onClose, toast }) {
 
   return (
     <Modal title="Settings" onClose={onClose} wide>
-      <ConfigForm form={form} setField={setField} />
+      <ConfigForm form={form} setField={setField} consolePasswordOptional />
       <TestResults results={testResults} />
       <div className="modal-footer">
         <button className="btn btn-ghost" onClick={test} disabled={testing}>
@@ -521,6 +592,7 @@ function SettingsModal({ onClose, toast }) {
 
 function LinksPanel({ toast, onMutate }) {
   const [data, setData]       = useState(null);
+  const [preflight, setPreflight] = useState(null);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [slug, setSlug]       = useState('');
@@ -529,8 +601,14 @@ function LinksPanel({ toast, onMutate }) {
 
   const load = useCallback(async () => {
     setLoading(true);
-    try { setData(await api('GET', '/api/links')); }
-    catch (e) { toast(e.message, 'err'); }
+    try {
+      const [linksRes, preRes] = await Promise.all([
+        api('GET', '/api/links'),
+        api('GET', '/api/links/preflight'),
+      ]);
+      setData(linksRes);
+      setPreflight(preRes);
+    } catch (e) { toast(e.message, 'err'); }
     finally { setLoading(false); }
   }, [toast]);
 
@@ -569,8 +647,9 @@ function LinksPanel({ toast, onMutate }) {
         </div>
         <button className="btn btn-primary"
           onClick={() => setShowAdd(true)}
-          disabled={data !== null && !data.list_exists}
-          title={data !== null && !data.list_exists ? 'Run Tofu bootstrap first' : undefined}
+          disabled={data !== null && (!data.list_exists || (preflight && !preflight.ready))}
+          title={data !== null && !data.list_exists ? 'Run Tofu bootstrap first'
+            : (preflight && !preflight.ready ? 'Fix setup issues below first' : undefined)}
         >+ New Link</button>
       </div>
 
@@ -580,31 +659,54 @@ function LinksPanel({ toast, onMutate }) {
         <div className="setup-notice">
           <h3>⚠ Tofu bootstrap required</h3>
           <p>The Cloudflare redirect list does not exist yet.<br/>
-          Run the Tofu config to create the list, ruleset, and<br/>
-          short domain DNS record, then return here.</p>
+          From the repo, run <span className="mono">cd tofu &amp;&amp; tofu init &amp;&amp; tofu apply</span><br/>
+          to create the list, ruleset, and short-domain DNS record, then refresh.</p>
+          {preflight?.issues?.length > 0 && (
+            <ul style={{ textAlign: 'left', maxWidth: '520px', margin: '16px auto 0', color: 'var(--text-3)', fontSize: '12px', fontFamily: 'var(--mono)', lineHeight: 1.7 }}>
+              {preflight.issues.map((msg, i) => <li key={i}>{msg}</li>)}
+            </ul>
+          )}
         </div>
-      ) : items.length === 0 ? <div className="empty">No short links yet. Add your first one.</div>
-      : (
-        <div className="table-wrap">
-          <table>
-            <thead><tr><th>Slug</th><th>Destination</th><th></th></tr></thead>
-            <tbody>
-              {items.map(item => {
-                const s = parseSlug(item.redirect?.source_url);
-                const t = item.redirect?.target_url;
-                return (
-                  <tr key={item.id}>
-                    <td><span className="slug">/{s}</span></td>
-                    <td><div className="url-cell" title={t}>{t}</div></td>
-                    <td className="td-actions">
-                      <button className="btn btn-danger btn-sm" onClick={() => del(item.id, s)}>✕</button>
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
+      ) : (
+        <>
+          {preflight && !preflight.ready && (
+            <div className="setup-notice" style={{ marginBottom: '16px' }}>
+              <h3>⚠ Short links may not work from the internet yet</h3>
+              <p style={{ marginBottom: preflight.issues?.length ? '12px' : 0 }}>
+                Fix the items below (often DNS proxying or the short domain in Settings), then refresh.
+              </p>
+              {preflight.issues?.length > 0 && (
+                <ul style={{ textAlign: 'left', maxWidth: '520px', margin: '0 auto', color: 'var(--text-3)', fontSize: '12px', fontFamily: 'var(--mono)', lineHeight: 1.7 }}>
+                  {preflight.issues.map((msg, i) => <li key={i}>{msg}</li>)}
+                </ul>
+              )}
+            </div>
+          )}
+          {items.length === 0 ? (
+            <div className="empty">No short links yet. Add your first one.</div>
+          ) : (
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Slug</th><th>Destination</th><th></th></tr></thead>
+                <tbody>
+                  {items.map(item => {
+                    const s = parseSlug(item.redirect?.source_url);
+                    const t = item.redirect?.target_url;
+                    return (
+                      <tr key={item.id}>
+                        <td><span className="slug">/{s}</span></td>
+                        <td><div className="url-cell" title={t}>{t}</div></td>
+                        <td className="td-actions">
+                          <button className="btn btn-danger btn-sm" onClick={() => del(item.id, s)}>✕</button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
       )}
 
       {showAdd && (
@@ -975,11 +1077,25 @@ function App() {
   const [showSettings, setShowSettings] = useState(false);
   const { toasts, add: toast }      = useToast();
 
-  useEffect(() => {
-    api('GET', '/api/config/status')
-      .then(s => setAppState(s.configured ? 'ready' : 'wizard'))
-      .catch(() => setAppState('wizard'));
+  const boot = useCallback(async () => {
+    try {
+      const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
+      const s = await r.json();
+      if (!s.configured) {
+        setAppState('wizard');
+        return;
+      }
+      if (s.login_required && !s.authenticated) {
+        setAppState('login');
+        return;
+      }
+      setAppState('ready');
+    } catch {
+      setAppState('wizard');
+    }
   }, []);
+
+  useEffect(() => { boot(); }, [boot]);
 
   // Fetch tab badge counts in parallel.  Uses allSettled so one failure
   // doesn't suppress the others (e.g. CF down but NPM still accessible).
@@ -1019,6 +1135,14 @@ function App() {
     </>
   );
 
+  // ── Login gate ──
+  if (appState === 'login') return (
+    <>
+      <LoginScreen toast={toast} onAuthed={() => setAppState('ready')} />
+      <ToastList toasts={toasts} />
+    </>
+  );
+
   // ── Ready state ──
   const TABS = [
     { id: 'links',    label: 'Short Links', count: counts.links    },
@@ -1039,6 +1163,10 @@ function App() {
           <span className="status-dot" />
           console
         </div>
+        <button className="btn btn-ghost btn-sm" style={{ marginLeft: 8 }} onClick={async () => {
+          try { await api('POST', '/api/auth/logout', null); } catch { /* ignore */ }
+          setAppState('login');
+        }} title="Sign out">Sign out</button>
         <button className="gear-btn" onClick={() => setShowSettings(true)} title="Settings">⚙</button>
       </header>
 

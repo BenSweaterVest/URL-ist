@@ -1,0 +1,15 @@
+# Local / secrets
+config.json
+**/config.json
+*.tfvars
+!**/terraform.tfvars.example
+.terraform/
+.tofu/
+*.tfstate
+*.tfstate.*
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

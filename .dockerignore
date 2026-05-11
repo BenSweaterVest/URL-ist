@@ -1,0 +1,6 @@
+.git
+.gitignore
+**/*.tfvars
+.terraform
+.tofu
+*.md
