@@ -1,0 +1,33 @@
+# terraform.tfvars.example
+# =========================
+# Copy this file to terraform.tfvars and fill in your values.
+#
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# IMPORTANT: Never commit terraform.tfvars to version control.
+# It contains your Cloudflare API token.  The .gitignore in this
+# directory already excludes it.
+
+# ── Cloudflare credentials ─────────────────────────────────────────────
+# Your API token needs three permissions:
+#   Zone > DNS > Edit                          (for the short domain A record)
+#   Account > Account Filter Lists > Edit      (for the redirect list)
+#   Account > Account Rulesets > Edit          (for the redirect ruleset)
+#
+# Create or update a token at:
+#   https://dash.cloudflare.com/profile/api-tokens
+
+cloudflare_api_token  = "your-cloudflare-api-token-here"
+cloudflare_account_id = "your-account-id-here"   # 32-char hex, in dashboard sidebar
+cloudflare_zone_id    = "your-zone-id-here"       # 32-char hex, on zone Overview page
+
+# ── Short link configuration ───────────────────────────────────────────
+
+# The subdomain for short links.
+# "short" creates short.yourdomain.com
+short_subdomain = "short"
+
+# Name of the Cloudflare redirect list.
+# Must match the CF_LIST_NAME setting in the console wizard.
+# Only lowercase letters, numbers, and underscores — no hyphens.
+cf_list_name = "shortlinks"

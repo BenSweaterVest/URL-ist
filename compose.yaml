@@ -1,0 +1,71 @@
+# PenguinNest Console — Docker Compose
+# ======================================
+# Unified management console for short links, DNS records, and NPM services.
+# Deploy on your Docker host; expose internally via your reverse proxy.
+#
+# ── First-run setup (no pre-configuration needed) ──────────────────────────
+# Deploy the stack, then open http://<your-server-ip>:8099 in your browser.
+# The setup wizard will prompt for Cloudflare and NPM credentials, test them,
+# and save them to /data/config.json (persisted by the volume below).
+#
+# After the wizard completes:
+#   1. Use the Services tab to register the console itself:
+#        Subdomain:    url
+#        Backend host: <your-server-ip>
+#        Backend port: 8099
+#      This creates the DNS record AND the NPM proxy host in one step.
+#
+#   2. Short links need a one-time Tofu bootstrap to create the Cloudflare
+#      list and redirect ruleset:
+#        cd tofu/ && tofu apply
+#      The Short Links tab shows a setup notice until this is done.
+#
+# ── Skipping the wizard ─────────────────────────────────────────────────────
+# To pre-configure instead of using the wizard, uncomment and populate the
+# environment section below.  The wizard is bypassed if all required vars
+# are present at startup.
+#
+# ── CF_API_TOKEN permissions required ──────────────────────────────────────
+#   Zone > DNS > Edit
+#   Account > Account Filter Lists > Edit   (short links)
+#   Account > Account Rulesets > Edit        (Tofu bootstrap only)
+
+services:
+  urlconsole:
+    build: .
+    container_name: urlconsole
+    restart: unless-stopped
+    ports:
+      - "8099:8000"
+    volumes:
+      - urlconsole_data:/data   # persists config.json across container restarts
+
+    # Uncomment to skip the setup wizard and pre-configure via environment:
+    # environment:
+    #   CF_API_TOKEN:  ""          # required
+    #   CF_ACCOUNT_ID: ""          # required
+    #   CF_ZONE_ID:    ""          # required
+    #   NPM_EMAIL:     ""          # required
+    #   NPM_PASSWORD:  ""          # required
+    #   NPM_URL:       "http://192.168.1.1:81"    # your NPM internal URL
+    #   DOMAIN:        "example.com"              # your domain
+    #   SHORT_DOMAIN:  "short.example.com"        # subdomain for short links
+    #   CF_LIST_NAME:  "shortlinks"               # must be alphanumeric + underscores
+    #   NPM_CERT_ID:   "2"         # wildcard cert ID in NPM
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  urlconsole_data:
+    # Config is stored in a named Docker volume by default.
+    # To use a host path instead (easier to inspect/back up), replace with:
+    #   driver: local
+    #   driver_opts:
+    #     type: none
+    #     o: bind
+    #     device: /home/youruser/stacks/console/data

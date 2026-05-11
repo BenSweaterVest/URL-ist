@@ -1,0 +1,1074 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PenguinNest Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Azeret+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #07090f;
+    --surface:  #0d1220;
+    --surface2: #121c30;
+    --border:   #1a2740;
+    --border2:  #223352;
+    --accent:   #38bdf8;
+    --accent-d: #0ea5e9;
+    --text:     #dde8f5;
+    --text-2:   #7b96bc;
+    --text-3:   #3d5478;
+    --ok:       #34d399;
+    --err:      #f87171;
+    --warn:     #fbbf24;
+    --radius:   6px;
+    --mono:     'Azeret Mono', monospace;
+    --sans:     'DM Sans', sans-serif;
+  }
+
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--surface); }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+  #root { min-height: 100vh; display: flex; flex-direction: column; }
+
+  /* ── Header ── */
+  .header { display: flex; align-items: center; gap: 12px; padding: 0 24px; height: 52px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
+  .header-logo { font-size: 22px; line-height: 1; }
+  .header-title { font-family: var(--mono); font-size: 13px; font-weight: 500; color: var(--accent); letter-spacing: 0.05em; }
+  .header-sub { font-family: var(--mono); font-size: 11px; color: var(--text-3); letter-spacing: 0.08em; margin-left: 2px; }
+  .header-spacer { flex: 1; }
+  .header-status { display: flex; align-items: center; gap: 6px; font-size: 11px; font-family: var(--mono); color: var(--text-3); }
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .gear-btn { width: 28px; height: 28px; border-radius: var(--radius); background: transparent; border: 1px solid var(--border2); color: var(--text-3); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 14px; transition: all 0.15s; margin-left: 8px; }
+  .gear-btn:hover { color: var(--text); background: var(--surface2); border-color: var(--border2); }
+
+  /* ── Tabs ── */
+  .tabs { display: flex; align-items: flex-end; gap: 2px; padding: 0 24px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
+  .tab { padding: 10px 18px 9px; cursor: pointer; font-size: 12px; font-weight: 500; color: var(--text-3); border-bottom: 2px solid transparent; transition: color 0.15s, border-color 0.15s; letter-spacing: 0.04em; text-transform: uppercase; user-select: none; }
+  .tab:hover { color: var(--text-2); }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-count { display: inline-flex; align-items: center; justify-content: center; background: var(--border2); color: var(--text-2); font-size: 10px; font-family: var(--mono); min-width: 16px; height: 16px; border-radius: 8px; padding: 0 4px; margin-left: 6px; vertical-align: 1px; }
+
+  /* ── Main ── */
+  .main { flex: 1; padding: 24px; overflow-y: auto; max-width: 1100px; width: 100%; margin: 0 auto; }
+  .panel-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+  .panel-title { font-size: 16px; font-weight: 600; }
+  .panel-desc { font-size: 12px; color: var(--text-3); margin-top: 2px; font-family: var(--mono); }
+
+  /* ── Buttons ── */
+  .btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: var(--radius); font-size: 12px; font-weight: 500; cursor: pointer; border: 1px solid transparent; transition: all 0.15s; font-family: var(--sans); }
+  .btn-primary { background: var(--accent-d); color: #fff; border-color: var(--accent-d); }
+  .btn-primary:hover { background: var(--accent); border-color: var(--accent); }
+  .btn-ghost { background: transparent; color: var(--text-2); border-color: var(--border2); }
+  .btn-ghost:hover { background: var(--surface2); color: var(--text); }
+  .btn-danger { background: transparent; color: var(--err); border-color: transparent; padding: 4px 8px; }
+  .btn-danger:hover { background: rgba(248,113,113,0.1); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-sm { padding: 4px 10px; font-size: 11px; }
+
+  /* ── Tables ── */
+  .table-wrap { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+  table { width: 100%; border-collapse: collapse; }
+  thead { background: var(--surface2); }
+  th { padding: 10px 14px; text-align: left; font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.1em; text-transform: uppercase; white-space: nowrap; }
+  td { padding: 11px 14px; border-top: 1px solid var(--border); font-size: 13px; vertical-align: middle; }
+  tr:hover td { background: rgba(56,189,248,0.03); }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .slug { color: var(--accent); font-family: var(--mono); font-size: 12px; }
+  .url-cell { color: var(--text-2); font-family: var(--mono); font-size: 11px; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ip-cell { color: var(--text-2); font-family: var(--mono); font-size: 12px; }
+  .td-actions { text-align: right; width: 60px; }
+  .cell-action { display: flex; align-items: center; gap: 6px; }
+
+  /* ── Empty / Loading ── */
+  .empty { padding: 40px; text-align: center; color: var(--text-3); font-size: 13px; }
+  .loading { padding: 40px; text-align: center; color: var(--text-3); font-size: 12px; font-family: var(--mono); }
+  .loading::after { content: ''; animation: dots 1.2s steps(3, end) infinite; }
+  @keyframes dots { 0%,20%{content:'.'} 40%{content:'..'} 60%,100%{content:'...'} }
+
+  /* ── Toasts ── */
+  .toast-wrap { position: fixed; bottom: 24px; right: 24px; display: flex; flex-direction: column; gap: 8px; z-index: 9999; }
+  .toast { padding: 10px 16px; border-radius: var(--radius); font-size: 12px; font-family: var(--mono); border: 1px solid; max-width: 380px; animation: toast-in 0.2s ease; }
+  .toast.ok  { background: rgba(52,211,153,0.1); border-color: var(--ok);  color: var(--ok);  }
+  .toast.err { background: rgba(248,113,113,0.1); border-color: var(--err); color: var(--err); }
+  @keyframes toast-in { from { opacity:0; transform: translateY(8px); } to { opacity:1; transform:translateY(0); } }
+
+  /* ── Modals ── */
+  .overlay { position: fixed; inset: 0; background: rgba(7,9,15,0.85); z-index: 100; display: flex; align-items: center; justify-content: center; padding: 20px; overflow-y: auto; }
+  .modal { background: var(--surface); border: 1px solid var(--border2); border-radius: 10px; width: 100%; max-width: 460px; padding: 24px; }
+  .modal-title { font-size: 15px; font-weight: 600; margin-bottom: 20px; }
+  .modal-footer { display: flex; gap: 8px; justify-content: flex-end; margin-top: 24px; }
+
+  /* ── Forms ── */
+  .field { margin-bottom: 16px; }
+  .field:last-of-type { margin-bottom: 0; }
+  label { display: block; font-size: 11px; font-weight: 600; color: var(--text-3); letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 6px; }
+  label.label-plain { text-transform: none; letter-spacing: normal; font-weight: 400; }
+  input[type=text], input[type=number], input[type=password], select { width: 100%; background: var(--bg); border: 1px solid var(--border2); color: var(--text); border-radius: var(--radius); padding: 8px 10px; font-size: 13px; font-family: var(--mono); outline: none; transition: border-color 0.15s; }
+  input:focus, select:focus { border-color: var(--accent-d); }
+  input::placeholder { color: var(--text-3); }
+  select { cursor: pointer; }
+  select option { background: var(--surface); }
+  .field-hint { font-size: 11px; color: var(--text-3); margin-top: 5px; font-family: var(--mono); line-height: 1.5; }
+  .field-prefix { display: flex; align-items: center; }
+  .field-pre { background: var(--surface2); border: 1px solid var(--border2); border-right: none; border-radius: var(--radius) 0 0 var(--radius); padding: 8px 10px; font-size: 11px; font-family: var(--mono); color: var(--text-3); white-space: nowrap; }
+  .field-suf { background: var(--surface2); border: 1px solid var(--border2); border-left: none; border-radius: 0 var(--radius) var(--radius) 0; padding: 8px 10px; font-size: 11px; font-family: var(--mono); color: var(--text-3); white-space: nowrap; }
+  .field-prefix input { border-radius: 0; }
+  .field-prefix input:last-child { border-radius: 0 var(--radius) var(--radius) 0; }
+  .check-row { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+  .check-row input[type=checkbox] { width: 14px; height: 14px; cursor: pointer; accent-color: var(--accent-d); flex-shrink: 0; }
+  .check-row span { font-size: 12px; color: var(--text-2); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid2 .span2 { grid-column: 1 / -1; }
+
+  /* ── Badges ── */
+  .badge { display: inline-flex; align-items: center; font-size: 10px; font-family: var(--mono); padding: 2px 7px; border-radius: 10px; font-weight: 500; }
+  .badge-blue  { background: rgba(56,189,248,0.12); color: var(--accent); }
+  .badge-green { background: rgba(52,211,153,0.12); color: var(--ok); }
+  .badge-gray  { background: var(--border); color: var(--text-3); }
+  .badge-warn  { background: rgba(251,191,36,0.12); color: var(--warn); }
+  .section-label { font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.1em; text-transform: uppercase; margin: 20px 0 10px; }
+  .section-label.warn { color: var(--warn); }
+
+  /* ── Setup notice ── */
+  .setup-notice { border: 1px dashed var(--border2); border-radius: var(--radius); padding: 24px; text-align: center; }
+  .setup-notice h3 { color: var(--warn); font-size: 13px; margin-bottom: 8px; }
+  .setup-notice p { color: var(--text-3); font-size: 12px; font-family: var(--mono); line-height: 1.6; }
+
+  /* ── Setup Wizard ────────────────────────────────────────────────────────── */
+  .wizard-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: var(--bg); padding: 24px; }
+  .wizard { width: 100%; max-width: 620px; background: var(--surface); border: 1px solid var(--border2); border-radius: 12px; padding: 32px; }
+  .wizard-brand { display: flex; align-items: center; gap: 14px; margin-bottom: 28px; padding-bottom: 24px; border-bottom: 1px solid var(--border); }
+  .wizard-brand-icon { font-size: 30px; line-height: 1; }
+  .wizard-brand-title { font-family: var(--mono); font-size: 16px; font-weight: 500; color: var(--accent); letter-spacing: 0.05em; }
+  .wizard-brand-sub { font-size: 12px; color: var(--text-3); margin-top: 3px; }
+  .wizard-section { margin-bottom: 24px; }
+  .wizard-section-title { font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.1em; text-transform: uppercase; border-bottom: 1px solid var(--border); padding-bottom: 8px; margin-bottom: 14px; }
+  .wizard-footer { display: flex; gap: 10px; justify-content: flex-end; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
+
+  /* ── Connection test results ── */
+  .test-block { background: var(--surface2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; margin: 16px 0; display: flex; flex-direction: column; gap: 8px; }
+  .test-row { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; font-family: var(--mono); line-height: 1.4; }
+  .test-row.ok  { color: var(--ok); }
+  .test-row.err { color: var(--err); }
+  .test-icon { flex-shrink: 0; margin-top: 1px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React 18 + Babel standalone for JSX (no build step required).
+     Versions are pinned to the minor version for stability.
+     SECURITY: For air-gapped or high-security deployments, download these
+     files once and serve them from /static/vendor/ instead.
+     See README for instructions. -->
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"
+  crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"
+  crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.26.10/babel.min.js"
+  crossorigin="anonymous"></script>
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+// ── API wrapper ───────────────────────────────────────────────────────────────
+// All calls go to relative paths so the frontend and backend share an origin.
+// Network errors (backend down) and HTTP errors are both surfaced as thrown
+// Error objects with actionable messages.
+
+const api = async (method, path, body) => {
+  let r;
+  try {
+    r = await fetch(path, {
+      method,
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      body:    body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    throw new Error(`Network error — is the backend running? (${e.message})`);
+  }
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({ detail: r.statusText }));
+    // FastAPI validation errors (422) return detail as an array of {msg, loc, type}.
+    const msg = Array.isArray(data.detail)
+      ? data.detail.map(e => e.msg).join('; ')
+      : (data.detail || r.statusText);
+    throw new Error(msg);
+  }
+  return r.json();
+};
+
+
+// ── Toast notifications ───────────────────────────────────────────────────────
+
+function useToast() {
+  const [toasts, setToasts] = useState([]);
+  // add() is stable (no deps) so panels can safely use it in useCallback deps.
+  const add = useCallback((msg, type = 'ok') => {
+    const id = Date.now();
+    setToasts(t => [...t, { id, msg, type }]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3500);
+  }, []);
+  return { toasts, add };
+}
+
+function ToastList({ toasts }) {
+  return (
+    <div className="toast-wrap">
+      {toasts.map(t => <div key={t.id} className={`toast ${t.type}`}>{t.msg}</div>)}
+    </div>
+  );
+}
+
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+// Escape closes; clicking the backdrop closes.
+
+function Modal({ title, onClose, children, wide }) {
+  useEffect(() => {
+    const h = e => e.key === 'Escape' && onClose();
+    document.addEventListener('keydown', h);
+    return () => document.removeEventListener('keydown', h);
+  }, [onClose]);
+  return (
+    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal" style={wide ? {maxWidth: '620px'} : {}}>
+        <div className="modal-title">{title}</div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+
+// ── Connection test results display ──────────────────────────────────────────
+
+function TestResults({ results }) {
+  if (!results) return null;
+  return (
+    <div className="test-block">
+      <div className={`test-row ${results.cloudflare.ok ? 'ok' : 'err'}`}>
+        <span className="test-icon">{results.cloudflare.ok ? '✓' : '✕'}</span>
+        <span>Cloudflare{results.cloudflare.error ? `: ${results.cloudflare.error}` : ': Connected'}</span>
+      </div>
+      <div className={`test-row ${results.npm.ok ? 'ok' : 'err'}`}>
+        <span className="test-icon">{results.npm.ok ? '✓' : '✕'}</span>
+        <span>NPM{results.npm.error ? `: ${results.npm.error}` : ': Connected'}</span>
+      </div>
+    </div>
+  );
+}
+
+
+// ── Config form fields (shared by wizard and settings modal) ──────────────────
+
+function ConfigForm({ form, setField }) {
+  return (
+    <>
+      {/* Cloudflare */}
+      <div className="wizard-section">
+        <div className="wizard-section-title">Cloudflare</div>
+        <div className="field">
+          <label>API Token</label>
+          <input type="password" placeholder="cfat_..." value={form.cf_api_token}
+            onChange={e => setField('cf_api_token', e.target.value)} />
+          <div className="field-hint">
+            Required permissions: Zone:DNS:Edit · Account:Account Filter Lists:Edit · Account:Account Rulesets:Edit<br/>
+            Find at: Cloudflare dashboard → My Profile → API Tokens
+          </div>
+        </div>
+        <div className="grid2">
+          <div className="field">
+            <label>Account ID</label>
+            <input type="text" placeholder="a1b2c3d4..." value={form.cf_account_id}
+              onChange={e => setField('cf_account_id', e.target.value)} />
+            <div className="field-hint">Cloudflare dashboard → right sidebar of any zone</div>
+          </div>
+          <div className="field">
+            <label>Zone ID</label>
+            <input type="text" placeholder="e5f6a7b8..." value={form.cf_zone_id}
+              onChange={e => setField('cf_zone_id', e.target.value)} />
+            <div className="field-hint">Cloudflare dashboard → your zone → Overview → API section</div>
+          </div>
+        </div>
+      </div>
+
+      {/* NPM */}
+      <div className="wizard-section">
+        <div className="wizard-section-title">Nginx Proxy Manager</div>
+        <div className="field">
+          <label>NPM URL</label>
+          <input type="text" placeholder="http://192.168.1.1:81" value={form.npm_url}
+            onChange={e => setField('npm_url', e.target.value)} />
+          <div className="field-hint">Internal URL of your NPM instance (not the public URL)</div>
+        </div>
+        <div className="grid2">
+          <div className="field">
+            <label>Email</label>
+            <input type="text" placeholder="admin@example.com" value={form.npm_email}
+              onChange={e => setField('npm_email', e.target.value)} />
+          </div>
+          <div className="field">
+            <label>Password</label>
+            <input type="password" placeholder="••••••••" value={form.npm_password}
+              onChange={e => setField('npm_password', e.target.value)} />
+          </div>
+        </div>
+        <div className="field">
+          <label>Wildcard SSL Cert ID</label>
+          <input type="number" placeholder="2" value={form.npm_cert_id}
+            onChange={e => setField('npm_cert_id', Number(e.target.value) || 1)} />
+          <div className="field-hint">
+            The certificate ID in NPM that covers *.yourdomain.com — find it in NPM → SSL Certificates → the cert ID shown in the URL when you click it
+          </div>
+        </div>
+      </div>
+
+      {/* Domains */}
+      <div className="wizard-section">
+        <div className="wizard-section-title">Domain Settings</div>
+        <div className="field">
+          <label>Base Domain</label>
+          <input type="text" placeholder="example.com" value={form.domain}
+            onChange={e => setField('domain', e.target.value)} />
+          <div className="field-hint">New services will be created as subdomain.{form.domain || 'yourdomain.com'}</div>
+        </div>
+        <div className="grid2">
+          <div className="field">
+            <label>Short Links Domain</label>
+            <input type="text" placeholder="short.example.com" value={form.short_domain}
+              onChange={e => setField('short_domain', e.target.value)} />
+            <div className="field-hint">Requires Tofu bootstrap after setup</div>
+          </div>
+          <div className="field">
+            <label>CF Redirect List Name</label>
+            <input type="text" placeholder="shortlinks" value={form.cf_list_name}
+              onChange={e => setField('cf_list_name', e.target.value)} />
+            <div className="field-hint">Cloudflare list name — alphanumeric and underscores only</div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+
+// ── Setup Wizard ──────────────────────────────────────────────────────────────
+// Shown on first launch when no configuration exists.
+// Full-page (not a closeable modal) — the app is non-functional until configured.
+
+const WIZARD_DEFAULTS = {
+  cf_api_token: '', cf_account_id: '', cf_zone_id: '',
+  npm_url: '', npm_email: '', npm_password: '',
+  npm_cert_id: 2, domain: '',
+  short_domain: '', cf_list_name: 'shortlinks',
+};
+
+function WizardScreen({ onComplete, toast }) {
+  const [form, setForm]             = useState(WIZARD_DEFAULTS);
+  const [testResults, setTestResults] = useState(null);
+  const [testing, setTesting]       = useState(false);
+  const [saving, setSaving]         = useState(false);
+
+  const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const requiredFilled = form.cf_api_token && form.cf_account_id && form.cf_zone_id
+                      && form.npm_email && form.npm_password
+                      && form.domain && form.npm_url;
+
+  const test = async () => {
+    setTesting(true);
+    setTestResults(null);
+    try {
+      const r = await api('POST', '/api/config/test', form);
+      setTestResults(r);
+    } catch (e) {
+      toast(e.message, 'err');
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api('POST', '/api/config', form);
+      toast('Configuration saved — welcome to PenguinNest Console!', 'ok');
+      onComplete();
+    } catch (e) {
+      toast(e.message, 'err');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="wizard-wrap">
+      <div className="wizard">
+        <div className="wizard-brand">
+          <span className="wizard-brand-icon">🐧</span>
+          <div>
+            <div className="wizard-brand-title">PENGUINNEST CONSOLE</div>
+            <div className="wizard-brand-sub">First-run setup — enter your credentials to get started</div>
+          </div>
+        </div>
+
+        <ConfigForm form={form} setField={setField} />
+
+        {/* Test results appear after clicking "Test Connections" */}
+        <TestResults results={testResults} />
+
+        <div className="wizard-footer">
+          <button className="btn btn-ghost" onClick={test}
+            disabled={testing || !requiredFilled}>
+            {testing ? 'Testing…' : 'Test Connections'}
+          </button>
+          <button className="btn btn-primary" onClick={save}
+            disabled={saving || !requiredFilled}>
+            {saving ? 'Saving…' : 'Save & Launch →'}
+          </button>
+        </div>
+
+        {!requiredFilled && (
+          <p style={{textAlign:'center', marginTop:'12px', fontSize:'11px', color:'var(--text-3)', fontFamily:'var(--mono)'}}>
+            Fill in all required fields above (marked with a label) to continue
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+// ── Settings Modal ────────────────────────────────────────────────────────────
+// Opened via the gear icon in the header.  Pre-populated from GET /api/config.
+// Sensitive fields show masked values; clearing and retyping updates them.
+
+function SettingsModal({ onClose, toast }) {
+  const [form, setForm]             = useState(null);
+  const [testResults, setTestResults] = useState(null);
+  const [testing, setTesting]       = useState(false);
+  const [saving, setSaving]         = useState(false);
+
+  const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  useEffect(() => {
+    api('GET', '/api/config').then(data => {
+      setForm(data);
+    }).catch(e => {
+      toast(e.message, 'err');
+      onClose();
+    });
+  }, []);
+
+  const test = async () => {
+    setTesting(true);
+    setTestResults(null);
+    try {
+      const r = await api('POST', '/api/config/test', form);
+      setTestResults(r);
+    } catch (e) {
+      toast(e.message, 'err');
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api('POST', '/api/config', form);
+      toast('Settings saved', 'ok');
+      onClose();
+    } catch (e) {
+      toast(e.message, 'err');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!form) return (
+    <div className="overlay">
+      <div className="modal" style={{textAlign:'center',padding:'40px',color:'var(--text-3)',fontFamily:'var(--mono)',fontSize:'12px'}}>
+        loading
+      </div>
+    </div>
+  );
+
+  return (
+    <Modal title="Settings" onClose={onClose} wide>
+      <ConfigForm form={form} setField={setField} />
+      <TestResults results={testResults} />
+      <div className="modal-footer">
+        <button className="btn btn-ghost" onClick={test} disabled={testing}>
+          {testing ? 'Testing…' : 'Test Connections'}
+        </button>
+        <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+        <button className="btn btn-primary" onClick={save} disabled={saving}>
+          {saving ? 'Saving…' : 'Save Settings'}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+
+// ── Links Panel ───────────────────────────────────────────────────────────────
+
+function LinksPanel({ toast, onMutate }) {
+  const [data, setData]       = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
+  const [slug, setSlug]       = useState('');
+  const [target, setTarget]   = useState('');
+  const [saving, setSaving]   = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { setData(await api('GET', '/api/links')); }
+    catch (e) { toast(e.message, 'err'); }
+    finally { setLoading(false); }
+  }, [toast]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const addLink = async () => {
+    if (!slug || !target) return;
+    setSaving(true);
+    try {
+      await api('POST', '/api/links', { slug, target });
+      toast(`/${slug} created`, 'ok');
+      setShowAdd(false); setSlug(''); setTarget('');
+      load(); onMutate();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setSaving(false); }
+  };
+
+  const del = async (id, s) => {
+    if (!confirm(`Delete /${s}?`)) return;
+    try {
+      await api('DELETE', `/api/links/${id}`);
+      toast(`/${s} deleted`, 'ok');
+      load(); onMutate();
+    } catch (e) { toast(e.message, 'err'); }
+  };
+
+  const parseSlug = url => url?.replace(/^https?:\/\/[^/]+\//, '') || '';
+  const items     = data?.items || [];
+
+  return (
+    <>
+      <div className="panel-header">
+        <div>
+          <div className="panel-title">Short Links</div>
+          <div className="panel-desc">short.yourdomain.com/{'{slug}'} → destination</div>
+        </div>
+        <button className="btn btn-primary"
+          onClick={() => setShowAdd(true)}
+          disabled={data !== null && !data.list_exists}
+          title={data !== null && !data.list_exists ? 'Run Tofu bootstrap first' : undefined}
+        >+ New Link</button>
+      </div>
+
+      {loading ? <div className="loading">loading</div>
+      : data === null ? <div className="empty">Could not load links — check the backend logs.</div>
+      : !data.list_exists ? (
+        <div className="setup-notice">
+          <h3>⚠ Tofu bootstrap required</h3>
+          <p>The Cloudflare redirect list does not exist yet.<br/>
+          Run the Tofu config to create the list, ruleset, and<br/>
+          short domain DNS record, then return here.</p>
+        </div>
+      ) : items.length === 0 ? <div className="empty">No short links yet. Add your first one.</div>
+      : (
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Slug</th><th>Destination</th><th></th></tr></thead>
+            <tbody>
+              {items.map(item => {
+                const s = parseSlug(item.redirect?.source_url);
+                const t = item.redirect?.target_url;
+                return (
+                  <tr key={item.id}>
+                    <td><span className="slug">/{s}</span></td>
+                    <td><div className="url-cell" title={t}>{t}</div></td>
+                    <td className="td-actions">
+                      <button className="btn btn-danger btn-sm" onClick={() => del(item.id, s)}>✕</button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {showAdd && (
+        <Modal title="New Short Link" onClose={() => setShowAdd(false)}>
+          <div className="field">
+            <label>Slug</label>
+            <div className="field-prefix">
+              <span className="field-pre">short domain/</span>
+              <input type="text" placeholder="ha" value={slug} autoFocus
+                onChange={e => setSlug(e.target.value.toLowerCase().replace(/[^a-z0-9\-_]/g, ''))} />
+            </div>
+            <div className="field-hint">Lowercase letters, numbers, hyphens, underscores</div>
+          </div>
+          <div className="field">
+            <label>Destination URL</label>
+            <input type="text" placeholder="https://ha.yourdomain.com" value={target}
+              onChange={e => setTarget(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && addLink()} />
+            <div className="field-hint">Must start with https:// or http://</div>
+          </div>
+          <div className="modal-footer">
+            <button className="btn btn-ghost" onClick={() => setShowAdd(false)}>Cancel</button>
+            <button className="btn btn-primary" onClick={addLink} disabled={saving || !slug || !target}>
+              {saving ? 'Creating…' : 'Create Link'}
+            </button>
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+
+// ── DNS Panel ─────────────────────────────────────────────────────────────────
+
+function DNSPanel({ toast, onMutate }) {
+  const [records, setRecords] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
+  const [name, setName]       = useState('');
+  const [ip, setIp]           = useState('');
+  const [proxied, setProxied] = useState(false);
+  const [saving, setSaving]   = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { setRecords(await api('GET', '/api/dns')); }
+    catch (e) { toast(e.message, 'err'); }
+    finally { setLoading(false); }
+  }, [toast]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const add = async () => {
+    if (!name) return;
+    setSaving(true);
+    try {
+      // Send name as-is — Cloudflare accepts both bare subdomains ('myservice')
+      // and FQDNs ('myservice.example.com') and normalises both to the FQDN.
+      // Never append a hardcoded domain here; the backend uses config.domain.
+      await api('POST', '/api/dns', { name, content: ip || undefined, proxied });
+      toast(`${name} created`, 'ok');
+      setShowAdd(false); setName(''); setIp(''); setProxied(false);
+      load(); onMutate();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setSaving(false); }
+  };
+
+  const del = async (id, n) => {
+    if (!confirm(`Delete DNS record for ${n}?`)) return;
+    try {
+      await api('DELETE', `/api/dns/${id}`);
+      toast(`${n} deleted`, 'ok');
+      load(); onMutate();
+    } catch (e) { toast(e.message, 'err'); }
+  };
+
+  return (
+    <>
+      <div className="panel-header">
+        <div>
+          <div className="panel-title">DNS Records</div>
+          <div className="panel-desc">A records for your zone</div>
+        </div>
+        <button className="btn btn-primary" onClick={() => setShowAdd(true)}>+ New Record</button>
+      </div>
+
+      {loading ? <div className="loading">loading</div>
+      : records === null ? <div className="empty">Could not load DNS records — check the backend logs.</div>
+      : records.length === 0 ? <div className="empty">No A records found.</div>
+      : (
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Name</th><th>IP</th><th>Proxied</th><th></th></tr></thead>
+            <tbody>
+              {records.map(r => (
+                <tr key={r.id}>
+                  <td><span className="mono">{r.name}</span></td>
+                  <td><span className="ip-cell">{r.content}</span></td>
+                  <td><span className={`badge ${r.proxied ? 'badge-blue' : 'badge-gray'}`}>
+                    {r.proxied ? 'proxied' : 'dns only'}
+                  </span></td>
+                  <td className="td-actions">
+                    <button className="btn btn-danger btn-sm" onClick={() => del(r.id, r.name)}>✕</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {showAdd && (
+        <Modal title="New DNS A Record" onClose={() => setShowAdd(false)}>
+          <div className="field">
+            <label>Subdomain</label>
+            <div className="field-prefix">
+              <input type="text" placeholder="myservice" value={name} autoFocus
+                onChange={e => setName(e.target.value.toLowerCase().replace(/[^a-z0-9.\-]/g, ''))} />
+              <span className="field-suf">.yourdomain.com</span>
+            </div>
+            <div className="field-hint">
+              Bare subdomain or full FQDN — both accepted.<br/>
+              Leave IP empty to default to your NPM host. Use 192.0.2.1 for Cloudflare-only redirect targets.
+            </div>
+          </div>
+          <div className="field">
+            <label>IP Address</label>
+            <input type="text" placeholder="(defaults to NPM host)"
+              value={ip} onChange={e => setIp(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && add()} />
+          </div>
+          <div className="field">
+            <label className="check-row label-plain">
+              <input type="checkbox" checked={proxied} onChange={e => setProxied(e.target.checked)} />
+              <span>Proxied through Cloudflare</span>
+            </label>
+          </div>
+          <div className="modal-footer">
+            <button className="btn btn-ghost" onClick={() => setShowAdd(false)}>Cancel</button>
+            <button className="btn btn-primary" onClick={add} disabled={saving || !name}>
+              {saving ? 'Creating…' : 'Create Record'}
+            </button>
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+
+// ── Services Panel ────────────────────────────────────────────────────────────
+// Shows /api/scan: NPM proxy hosts cross-referenced with DNS records.
+// Works on fresh (empty) and existing (populated) deployments.
+
+const EMPTY_FORM = {
+  subdomain: '', forward_host: '', forward_port: '',
+  forward_scheme: 'http', websocket: false, ssl_verify_off: false,
+};
+
+function ServicesPanel({ toast, onMutate }) {
+  const [scan, setScan]           = useState(null);
+  const [loading, setLoading]     = useState(true);
+  const [showAdd, setShowAdd]     = useState(false);
+  const [form, setForm]           = useState(EMPTY_FORM);
+  const [saving, setSaving]       = useState(false);
+  const [fixingDns, setFixingDns] = useState(null);
+
+  const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try { setScan(await api('GET', '/api/scan')); }
+    catch (e) { toast(e.message, 'err'); }
+    finally { setLoading(false); }
+  }, [toast]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const add = async () => {
+    if (!form.subdomain || !form.forward_host || !form.forward_port) return;
+    setSaving(true);
+    try {
+      const res = await api('POST', '/api/services', { ...form, forward_port: Number(form.forward_port) });
+      toast(`${res.domain} created`, 'ok');
+      setShowAdd(false); setForm(EMPTY_FORM);
+      load(); onMutate();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setSaving(false); }
+  };
+
+  // Add missing DNS record for an existing NPM proxy host.
+  // Uses npm_host from the scan response so the IP is always consistent.
+  const addDnsForService = async (domain) => {
+    const npmHost = scan?.npm_host;
+    setFixingDns(domain);
+    try {
+      await api('POST', '/api/dns', { name: domain, content: npmHost, proxied: false });
+      toast(`DNS added: ${domain} → ${npmHost}`, 'ok');
+      load(); onMutate();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setFixingDns(null); }
+  };
+
+  const services      = scan?.services        || [];
+  const unmatchedDns  = scan?.unmatched_dns   || [];
+  const passthroughDns = scan?.passthrough_dns || [];
+
+  return (
+    <>
+      <div className="panel-header">
+        <div>
+          <div className="panel-title">Services</div>
+          <div className="panel-desc">NPM proxy hosts × Cloudflare DNS health</div>
+        </div>
+        <button className="btn btn-primary" onClick={() => setShowAdd(true)}>+ New Service</button>
+      </div>
+
+      {/* Main services table */}
+      {loading ? <div className="loading">loading</div>
+      : scan === null ? <div className="empty">Could not load services — check the backend logs.</div>
+      : services.length === 0 ? <div className="empty">No services configured yet. Use the button above to add the first one.</div>
+      : (
+        <div className="table-wrap">
+          <table>
+            <thead><tr><th>Domain</th><th>Backend</th><th>DNS</th><th>SSL</th><th>WS</th><th>Status</th></tr></thead>
+            <tbody>
+              {services.map(({ proxy_host: h, status }) => {
+                const domain = h.domain_names?.[0];
+                return (
+                  <tr key={h.id}>
+                    <td><span className="mono">{domain}</span></td>
+                    <td><span className="ip-cell">{h.forward_scheme}://{h.forward_host}:{h.forward_port}</span></td>
+                    <td>
+                      {status === 'ok'
+                        ? <span className="badge badge-green">✓ dns</span>
+                        : <span className="cell-action">
+                            <span className="badge badge-warn">missing</span>
+                            <button className="btn btn-ghost btn-sm"
+                              onClick={() => addDnsForService(domain)}
+                              disabled={fixingDns === domain}>
+                              {fixingDns === domain ? '…' : 'Add DNS'}
+                            </button>
+                          </span>
+                      }
+                    </td>
+                    <td>{h.certificate_id > 0 ? <span className="badge badge-green">ssl</span> : <span className="badge badge-gray">none</span>}</td>
+                    <td>{h.allow_websocket_upgrade ? <span className="badge badge-blue">ws</span> : <span className="badge badge-gray">—</span>}</td>
+                    <td>{h.enabled ? <span className="badge badge-green">● online</span> : <span className="badge badge-gray">● off</span>}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Unmatched DNS: A records → NPM IP with no proxy host (orphaned/half-configured) */}
+      {unmatchedDns.length > 0 && (
+        <>
+          <div className="section-label warn">⚠ DNS → NPM with no proxy host ({unmatchedDns.length})</div>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Name</th><th>IP</th><th>Note</th></tr></thead>
+              <tbody>
+                {unmatchedDns.map(r => (
+                  <tr key={r.id}>
+                    <td><span className="mono">{r.name}</span></td>
+                    <td><span className="ip-cell">{r.content}</span></td>
+                    <td><span className="badge badge-warn">no proxy host — orphaned?</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {/* Passthrough DNS: A records NOT → NPM (intentional: Cloudflare Workers, etc.) */}
+      {passthroughDns.length > 0 && (
+        <>
+          <div className="section-label">Cloudflare-only records ({passthroughDns.length})</div>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Name</th><th>IP</th><th>Note</th></tr></thead>
+              <tbody>
+                {passthroughDns.map(r => (
+                  <tr key={r.id}>
+                    <td><span className="mono">{r.name}</span></td>
+                    <td><span className="ip-cell">{r.content}</span></td>
+                    <td><span className="badge badge-gray">no NPM host expected</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {/* New Service modal */}
+      {showAdd && (
+        <Modal title="New Service" onClose={() => setShowAdd(false)}>
+          <div className="grid2">
+            <div className="field span2">
+              <label>Subdomain</label>
+              <div className="field-prefix">
+                <input type="text" placeholder="myservice" value={form.subdomain} autoFocus
+                  onChange={e => setField('subdomain', e.target.value.toLowerCase().replace(/[^a-z0-9\-]/g,'').replace(/^-+/,''))} />
+                <span className="field-suf">.yourdomain.com</span>
+              </div>
+              <div className="field-hint">Subdomain only — base domain is appended automatically.</div>
+            </div>
+            <div className="field">
+              <label>Backend Scheme</label>
+              <select value={form.forward_scheme} onChange={e => setField('forward_scheme', e.target.value)}>
+                <option value="http">http</option>
+                <option value="https">https</option>
+              </select>
+            </div>
+            <div className="field">
+              <label>Backend Host</label>
+              <input type="text" placeholder="192.168.1.100" value={form.forward_host}
+                onChange={e => setField('forward_host', e.target.value)} />
+            </div>
+            <div className="field span2">
+              <label>Backend Port</label>
+              <input type="number" placeholder="8080" value={form.forward_port}
+                onChange={e => setField('forward_port', e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && add()} />
+            </div>
+            <div className="field span2">
+              <label className="check-row label-plain">
+                <input type="checkbox" checked={form.websocket} onChange={e => setField('websocket', e.target.checked)} />
+                <span>Enable WebSocket support</span>
+              </label>
+            </div>
+            <div className="field span2">
+              <label className="check-row label-plain">
+                <input type="checkbox" checked={form.ssl_verify_off} onChange={e => setField('ssl_verify_off', e.target.checked)} />
+                <span>Disable SSL verification — for self-signed backend certs (Portainer, Cockpit, Vaultwarden)</span>
+              </label>
+            </div>
+          </div>
+          <div className="modal-footer">
+            <button className="btn btn-ghost" onClick={() => setShowAdd(false)}>Cancel</button>
+            <button className="btn btn-primary" onClick={add}
+              disabled={saving || !form.subdomain || !form.forward_port}>
+              {saving ? 'Creating…' : 'Create Service'}
+            </button>
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
+
+// ── App root ──────────────────────────────────────────────────────────────────
+// Lifecycle:
+//   'loading'  → checking /api/config/status on mount
+//   'wizard'   → not configured; shows WizardScreen (full page, no tabs)
+//   'ready'    → configured; shows main app with header/tabs/panels
+
+function App() {
+  const [appState, setAppState]     = useState('loading');
+  const [tab, setTab]               = useState('links');
+  const [counts, setCounts]         = useState({ links: null, dns: null, services: null });
+  const [showSettings, setShowSettings] = useState(false);
+  const { toasts, add: toast }      = useToast();
+
+  useEffect(() => {
+    api('GET', '/api/config/status')
+      .then(s => setAppState(s.configured ? 'ready' : 'wizard'))
+      .catch(() => setAppState('wizard'));
+  }, []);
+
+  // Fetch tab badge counts in parallel.  Uses allSettled so one failure
+  // doesn't suppress the others (e.g. CF down but NPM still accessible).
+  const refreshCounts = useCallback(async () => {
+    const [links, dns, services] = await Promise.allSettled([
+      api('GET', '/api/links'),
+      api('GET', '/api/dns'),
+      api('GET', '/api/proxy-hosts'),
+    ]);
+    setCounts({
+      links:    links.status    === 'fulfilled' ? (links.value.items?.length    ?? 0) : null,
+      dns:      dns.status      === 'fulfilled' ? (dns.value.length             ?? 0) : null,
+      services: services.status === 'fulfilled' ? (services.value.length        ?? 0) : null,
+    });
+  }, []);
+
+  useEffect(() => {
+    if (appState === 'ready') refreshCounts();
+  }, [appState, refreshCounts]);
+
+  // ── Loading state ──
+  if (appState === 'loading') return (
+    <>
+      <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:'100vh',
+        color:'var(--text-3)',fontFamily:'var(--mono)',fontSize:'12px'}}>
+        loading
+      </div>
+      <ToastList toasts={toasts} />
+    </>
+  );
+
+  // ── Wizard state ──
+  if (appState === 'wizard') return (
+    <>
+      <WizardScreen toast={toast} onComplete={() => { setAppState('ready'); }} />
+      <ToastList toasts={toasts} />
+    </>
+  );
+
+  // ── Ready state ──
+  const TABS = [
+    { id: 'links',    label: 'Short Links', count: counts.links    },
+    { id: 'dns',      label: 'DNS',         count: counts.dns      },
+    { id: 'services', label: 'Services',    count: counts.services },
+  ];
+
+  return (
+    <>
+      <header className="header">
+        <span className="header-logo">🐧</span>
+        <div>
+          <div className="header-title">PENGUINNEST</div>
+          <div className="header-sub">CONSOLE</div>
+        </div>
+        <div className="header-spacer" />
+        <div className="header-status">
+          <span className="status-dot" />
+          console
+        </div>
+        <button className="gear-btn" onClick={() => setShowSettings(true)} title="Settings">⚙</button>
+      </header>
+
+      <nav className="tabs">
+        {TABS.map(t => (
+          <div key={t.id} className={`tab ${tab === t.id ? 'active' : ''}`} onClick={() => setTab(t.id)}>
+            {t.label}
+            {t.count !== null && <span className="tab-count">{t.count}</span>}
+          </div>
+        ))}
+      </nav>
+
+      <main className="main">
+        {/* Each panel mounts on tab activation and unmounts on switch,
+            giving a fresh data load on each visit — no stale state. */}
+        {tab === 'links'    && <LinksPanel    toast={toast} onMutate={refreshCounts} />}
+        {tab === 'dns'      && <DNSPanel      toast={toast} onMutate={refreshCounts} />}
+        {tab === 'services' && <ServicesPanel toast={toast} onMutate={refreshCounts} />}
+      </main>
+
+      {showSettings && (
+        <SettingsModal toast={toast} onClose={() => setShowSettings(false)} />
+      )}
+
+      <ToastList toasts={toasts} />
+    </>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
