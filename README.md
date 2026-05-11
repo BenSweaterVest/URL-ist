@@ -1,4 +1,4 @@
-# PenguinNest Console
+# URLer
 
 A self-hosted management console for [Cloudflare](https://cloudflare.com) + [Nginx Proxy Manager](https://nginxproxymanager.com), built for homelab use.
 
@@ -15,7 +15,7 @@ A self-hosted management console for [Cloudflare](https://cloudflare.com) + [Ngi
 Short links:         short.yourdomain.com/ha  →  https://ha.yourdomain.com
                      (Cloudflare edge — single-digit ms, always-on, no origin hit)
 
-Management console:  console.yourdomain.com
+Management console:  urler.yourdomain.com
                      (internal only, behind your reverse proxy)
 ```
 
@@ -29,31 +29,39 @@ Management console:  console.yourdomain.com
 - **OpenTofu** (or Terraform) for the one-time short-link bootstrap  
   → Install: https://opentofu.org/docs/intro/install/
 
+> If you don’t have Docker installed yet: install Docker Engine + the Compose plugin for your OS (or Docker Desktop on Windows), then come back here.
+
 ---
 
 ## Quick Start
 
-### 1. Deploy the console
+### 1. Deploy URLer
 
 ```bash
-git clone https://github.com/YOUR_USER/URList.git ~/stacks/console && cd ~/stacks/console
+git clone https://github.com/YOUR_USER/urler.git ~/stacks/urler && cd ~/stacks/urler
 
 # Optional but recommended: set a random SESSION_SECRET in compose.yaml
-# (e.g. openssl rand -hex 32) so login cookies cannot be forged.
+# (e.g. openssl rand -hex 32) so login cookies are stable across restarts.
 
 docker compose up -d --build
 ```
 
-Open `http://<your-server-ip>:8099` — the **setup wizard** will guide you through choosing a **console password** (this app only — not your OS or NPM account), then your Cloudflare and NPM credentials. Settings are saved to a persistent Docker volume (`/data/config.json`) and applied immediately — no container restart needed.
+Open `http://<your-server-ip>:8099` — the **setup wizard** will guide you through choosing a **URLer password** (this app only — not your OS or NPM account), then your Cloudflare and NPM credentials. Settings are saved to a persistent Docker volume (`/data/config.json`) and applied immediately — no container restart needed.
 
-### 2. Register the console in NPM (optional but recommended)
+**After first setup:** Restart the container once so the session middleware uses the persisted `session_secret`:
 
-Once the wizard is complete, use the **Services** tab to add the console itself:
-- Subdomain: `console`
+```bash
+docker compose restart
+```
+
+### 2. Register URLer in NPM (optional but recommended)
+
+Once the wizard is complete, use the **Services** tab to add URLer itself:
+- Subdomain: `urler`
 - Backend host: `<your-server-ip>`
 - Backend port: `8099`
 
-This creates `console.yourdomain.com` accessible via HTTPS through NPM.
+This creates `urler.yourdomain.com` accessible via HTTPS through NPM.
 
 ### 3. Bootstrap short links (one-time Tofu setup)
 
@@ -78,7 +86,7 @@ After a successful `tofu apply`, the Short Links tab becomes active. All ongoing
 
 ## Cloudflare API Token
 
-The console requires a single Cloudflare API token. For short links (Tofu bootstrap), it needs additional account-level permissions.
+URLer requires a single Cloudflare API token. For short links (Tofu bootstrap), it needs additional account-level permissions.
 
 **Required permissions:**
 
@@ -118,12 +126,14 @@ Settings are saved to `/data/config.json` inside the container (persisted via Do
 | **CF List Name** | Cloudflare list name — must match `cf_list_name` in `terraform.tfvars` | For short links |
 | **NPM Cert ID** | ID of the wildcard SSL certificate in NPM (find in NPM → SSL Certificates) | For new services |
 
-**Console password:** Set in the wizard (stored as a salted hash in `config.json`). Used only to unlock this web UI — it is **not** tied to your Ubuntu `sudo` password (the app runs in Docker and cannot safely verify OS logins). You may reuse the same passphrase if you want, but it is stored separately.
+**URLer password:** Set in the wizard (stored as a salted hash in `config.json`). Used only to unlock this web UI — it is **not** tied to your Ubuntu `sudo` password (the app runs in Docker and cannot safely verify OS logins). You may reuse the same passphrase if you want, but it is stored separately.
 
 **Skipping the wizard (env vars):**  
 Uncomment and populate the `environment:` section in `compose.yaml`. The app will start fully configured and skip the wizard. Set **`CONSOLE_PASSWORD`** there if you need a plaintext bootstrap password before the first save to `config.json` (on first successful login, a hash is written and the env-only path is no longer used).
 
 **Session signing:** Set **`SESSION_SECRET`** (long random string, ≥16 characters) in `compose.yaml` so session cookies cannot be forged by anyone who can reach the container port. Optional `session_secret` in `config.json` is used as a fallback if `SESSION_SECRET` is not set.
+
+If you do not set `SESSION_SECRET`, the wizard will generate and persist a `session_secret` into `config.json`. **Restart once after setup** so the middleware loads that persisted key (otherwise sessions are signed with a per-process random key and will reset on restart).
 
 ---
 
@@ -145,6 +155,8 @@ The authenticated API **`GET /api/links/preflight`** returns whether the redirec
 
 Your home server is never contacted for short link redirects. The console only needs to be running when you *manage* (add/delete) links — not for the redirects themselves.
 
+> **Important:** Do not delete your configured short-links domain A record from the DNS tab. If removed, short links stop working until the record is recreated (typically by re-running `tofu apply`).
+
 **Availability**: Short links work even if your home server is offline.  
 **Latency**: Single-digit milliseconds from any location (Cloudflare edge node near the user, not your home upload speed).  
 **Cost**: Free tier covers personal use (no Workers, just native Cloudflare rules).
@@ -162,7 +174,7 @@ If NPM proxy host creation fails, the DNS record is automatically rolled back. I
 
 Tofu creates the **infrastructure** once (the redirect list, the ruleset, the short domain DNS record). These are permanent resources that never need to change.
 
-The console manages **data** — the entries in the list, new DNS records, new NPM hosts. These are runtime operations that happen frequently and don't belong in version-controlled HCL.
+URLer manages **data** — the entries in the list, new DNS records, new NPM hosts. These are runtime operations that happen frequently and don't belong in version-controlled HCL.
 
 If you're already using Tofu to manage DNS records for your domain, records created via the console won't be in your Tofu state. That's intentional: the console is the source of truth for additions going forward. `tofu plan` will not touch records it doesn't know about.
 
@@ -201,21 +213,26 @@ If you're already using Tofu to manage DNS records for your domain, records crea
 
 ### Running behind NPM
 
-The console itself can be proxied through NPM like any other service:
+URLer itself can be proxied through NPM like any other service:
 
-1. Use the **Services** tab to create `console.yourdomain.com` pointing to `<your-server-ip>:8099`
-2. Or add it manually in NPM: domain `console.yourdomain.com`, forward to `http://<ip>:8099`, enable your wildcard cert
+1. Use the **Services** tab to create `urler.yourdomain.com` pointing to `<your-server-ip>:8099`
+2. Or add it manually in NPM: domain `urler.yourdomain.com`, forward to `http://<ip>:8099`, enable your wildcard cert
 
 No special NPM settings needed (no WebSocket support, no `proxy_ssl_verify off`).
 
+If you proxy through NPM over HTTPS, set these in `compose.yaml`:
+
+- `SESSION_COOKIE_HTTPS_ONLY=1`
+- `TRUST_PROXY_HEADERS=1` (so login rate limiting uses real client IPs)
+
 ### Persistent configuration
 
-Configuration is stored in a Docker named volume (`urlconsole_data` mounted at `/data`). To use a host path instead (easier to back up):
+Configuration is stored in a Docker named volume (`urler_data` mounted at `/data`). To use a host path instead (easier to back up):
 
 ```yaml
 # In compose.yaml, replace the volumes section at the bottom:
 volumes:
-  urlconsole_data:
+  urler_data:
     driver: local
     driver_opts:
       type: none
@@ -256,7 +273,7 @@ Configuration in `/data/config.json` is preserved across updates.
 
 ## Security
 
-This console manages your Cloudflare DNS and API credentials. Keep it internal.
+URLer manages your Cloudflare DNS and API credentials. Keep it internal.
 
 **Access control**: Do not expose port 8099 to the public internet. The app requires a **console password** and a **signed session cookie** for all API calls after setup. Still treat network access as part of your trust boundary: combine the password with LAN-only or VPN-only reachability, firewall rules, and a strong session signing key.
 
@@ -273,6 +290,8 @@ This console manages your Cloudflare DNS and API credentials. Keep it internal.
 **Behind NPM**: If you proxy through NPM, enable **`TRUST_PROXY_HEADERS=1`** so rate limiting keys off the real client IP from `X-Forwarded-For` (only do this behind a trusted reverse proxy).
 
 **Backups**: Back up the Docker volume (or host bind mount) that holds **`/data/config.json`** — it contains Cloudflare/NPM credentials and your console password hash.
+
+**Config history**: URLer keeps a rolling history of prior configs under **`/data/config-versions/`** (default: last 100). You can change retention with `CONFIG_HISTORY_LIMIT` (set to `0` to disable).
 
 **NPM proxying**: If you expose the console via NPM (`console.yourdomain.com`), ensure that DNS record is **not** publicly accessible — point it to your NPM's internal IP only, and do not open inbound firewall ports for it. Or use Tailscale for external access instead.
 

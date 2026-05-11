@@ -37,4 +37,4 @@ jobs:
         run: pip-audit -r requirements.txt || true
 
       - name: Docker build smoke
-        run: docker build -t penguinnest-console:ci .
+        run: docker build -t urler:ci .

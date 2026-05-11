@@ -1,4 +1,4 @@
-# urls.tf — PenguinNest Console: Short Link Infrastructure Bootstrap
+# urls.tf — URLer: Short Link Infrastructure Bootstrap
 # ===================================================================
 # Run this once before using the Short Links tab in the console.
 # It creates three permanent Cloudflare resources:

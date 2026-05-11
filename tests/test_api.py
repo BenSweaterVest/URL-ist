@@ -24,6 +24,32 @@ def test_wizard_endpoints_without_auth(client: TestClient) -> None:
     assert client.get("/api/auth/status").status_code == 200
 
 
+def test_config_endpoints_auth_gated_after_configuration() -> None:
+    """Before config: open; after config: /api/config* requires session."""
+    fresh = TestClient(main_module.app)
+    assert fresh.get("/api/config").status_code == 200
+
+    body = {
+        "cf_api_token": "x",
+        "cf_account_id": "c" * 32,
+        "cf_zone_id": "d" * 32,
+        "npm_url": "http://127.0.0.1:81",
+        "npm_email": "a@b.com",
+        "npm_password": "p",
+        "npm_cert_id": 2,
+        "domain": "example.com",
+        "short_domain": "",
+        "cf_list_name": "shortlinks",
+        "console_password": "longenough1",
+        "console_password_confirm": "longenough1",
+    }
+    assert fresh.post("/api/config", json=body).status_code == 200
+
+    unauth2 = TestClient(main_module.app)
+    assert unauth2.get("/api/config").status_code == 401
+    assert unauth2.get("/api/config/status").status_code == 401
+
+
 def test_protected_route_401_without_session(client: TestClient) -> None:
     body = {
         "cf_api_token": "x",
@@ -88,6 +114,21 @@ def test_login_rate_limit(client: TestClient) -> None:
         assert r.status_code == 401
     blocked = client.post("/api/auth/login", json={"password": "wrong"})
     assert blocked.status_code == 429
+
+
+def test_csrf_enforced_on_unsafe_methods(configured_client: TestClient, csrf_headers: dict[str, str]) -> None:
+    """Unsafe method without CSRF should 403; with CSRF should pass auth layer."""
+    # Without CSRF token -> blocked by middleware
+    r = configured_client.post("/api/dns", json={"name": "x", "content": "10.0.0.1", "proxied": False})
+    assert r.status_code == 403, r.text
+
+    # With CSRF token -> passes CSRF; request may still fail because Cloudflare isn't mocked
+    r2 = configured_client.post(
+        "/api/dns",
+        json={"name": "x", "content": "10.0.0.1", "proxied": False},
+        headers=csrf_headers,
+    )
+    assert r2.status_code != 403, r2.text
 
 
 def test_preflight_authenticated_stub(monkeypatch: pytest.MonkeyPatch, configured_client: TestClient) -> None:

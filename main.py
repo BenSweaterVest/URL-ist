@@ -1,8 +1,8 @@
 """
-PenguinNest Console — API Backend
-==================================
-FastAPI application serving the unified PenguinNest management console at
-your internal URL (e.g. console.yourdomain.com — not publicly exposed).
+URLer — API Backend
+====================
+FastAPI application serving the URLer management console at your internal URL
+(e.g. urler.yourdomain.com — not publicly exposed).
 
 On first launch the app starts in unconfigured mode and serves a setup wizard
 that collects credentials, tests them, and saves them to /data/config.json.
@@ -67,13 +67,58 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 from starlette.middleware.sessions import SessionMiddleware
 
-logger = logging.getLogger("console")
+logger = logging.getLogger("urler")
 
 __version__ = "1.0.1"
 
 CF_BASE     = "https://api.cloudflare.com/client/v4"
 MASK_CHAR   = "•"   # used to mask secrets in GET /api/config responses
 CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", "/data/config.json"))
+CONFIG_HISTORY_DIR = Path(os.environ.get("CONFIG_HISTORY_DIR", "/data/config-versions"))
+
+
+def _config_history_limit() -> int:
+    """How many prior config snapshots to keep on disk."""
+    raw = os.environ.get("CONFIG_HISTORY_LIMIT", "").strip()
+    if not raw:
+        return 100
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(f"Invalid CONFIG_HISTORY_LIMIT={raw!r}; using 100")
+        return 100
+
+
+def _write_config_snapshot(prior_path: Path) -> None:
+    """Save the previous config.json into CONFIG_HISTORY_DIR with rotation."""
+    if not prior_path.exists():
+        return
+    limit = _config_history_limit()
+    if limit <= 0:
+        return
+
+    try:
+        CONFIG_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        snap = CONFIG_HISTORY_DIR / f"config-{ts}.json"
+        # Avoid collision in fast consecutive saves
+        if snap.exists():
+            snap = CONFIG_HISTORY_DIR / f"config-{ts}-{secrets.token_hex(4)}.json"
+        snap.write_text(prior_path.read_text(), encoding="utf-8")
+        snap.chmod(0o600)
+    except OSError as e:
+        logger.warning(f"Could not write config snapshot: {e}")
+        return
+
+    try:
+        snaps = sorted(CONFIG_HISTORY_DIR.glob("config-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in snaps[limit:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 # If neither SESSION_SECRET nor config.json provides a secret, we use a per-process
 # random key. This is secure (not guessable), but sessions will be invalidated on
@@ -274,6 +319,8 @@ class Config:
     short_domain:  str = ""
     cf_list_name:  str = "shortlinks"
     console_password_hash: str = ""
+    uptime_kuma_url: str = ""
+    homepage_url:    str = ""
 
     # ── Derived properties ────────────────────────────────────────────────────
 
@@ -388,6 +435,8 @@ def _load_config() -> None:
         short_domain  = _get("short_domain", ""),
         cf_list_name  = _get("cf_list_name", "shortlinks"),
         console_password_hash = _get("console_password_hash", ""),
+        uptime_kuma_url = _get("uptime_kuma_url", ""),
+        homepage_url    = _get("homepage_url", ""),
     )
 
     if not config.console_password_hash:
@@ -436,7 +485,7 @@ async def lifespan(app: FastAPI):
     _load_config()
     _cf_client  = httpx.AsyncClient(timeout=10.0)
     _npm_client = httpx.AsyncClient(timeout=10.0)
-    logger.info("PenguinNest Console starting")
+    logger.info("URLer starting")
     if config.is_configured():
         logger.info(f"  Domain:       {config.domain}")
         logger.info(f"  Short domain: {config.short_domain}")
@@ -458,10 +507,10 @@ async def lifespan(app: FastAPI):
         await _cf_client.aclose()
     if _npm_client:
         await _npm_client.aclose()
-    logger.info("PenguinNest Console shutting down")
+    logger.info("URLer shutting down")
 
 
-app = FastAPI(title="PenguinNest Console", lifespan=lifespan)
+app = FastAPI(title="URLer", lifespan=lifespan)
 app.add_middleware(
     SessionMiddleware,
     secret_key=_session_secret(),
@@ -788,6 +837,8 @@ async def get_config():
         "short_domain":   config.short_domain,
         "cf_list_name":   config.cf_list_name,
         "console_password_set": bool(config.console_password_hash or _console_password_env),
+        "uptime_kuma_url": config.uptime_kuma_url,
+        "homepage_url":    config.homepage_url,
     }
 
 
@@ -816,6 +867,8 @@ class ConfigProposal(BaseModel):
     cf_list_name:  str = "shortlinks"
     console_password:         str = ""
     console_password_confirm: str = ""
+    uptime_kuma_url: str = ""
+    homepage_url:    str = ""
 
     @field_validator("npm_cert_id")
     @classmethod
@@ -963,6 +1016,8 @@ async def save_config(proposal: ConfigProposal):
         "short_domain":  proposal.short_domain,
         "cf_list_name":  proposal.cf_list_name,
         "console_password_hash": final_hash,
+        "uptime_kuma_url": proposal.uptime_kuma_url.strip(),
+        "homepage_url":    proposal.homepage_url.strip(),
     }
 
     if final_hash:
@@ -974,6 +1029,7 @@ async def save_config(proposal: ConfigProposal):
 
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
+        _write_config_snapshot(CONFIG_FILE)
         CONFIG_FILE.write_text(json.dumps(config_data, indent=2))
         CONFIG_FILE.chmod(0o600)  # credentials — owner read/write only
     except OSError as e:
@@ -1106,6 +1162,18 @@ class LinkCreate(BaseModel):
         return v
 
 
+class LinkUpdate(BaseModel):
+    target: str
+
+    @field_validator("target")
+    @classmethod
+    def validate_target(cls, v: str) -> str:
+        v = v.strip()
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("Target must start with http:// or https://")
+        return v
+
+
 @app.post("/api/links", status_code=201)
 async def create_link(link: LinkCreate):
     """Add a redirect entry: SHORT_DOMAIN/{slug} → target (301).
@@ -1145,6 +1213,77 @@ async def delete_link(item_id: str):
     )
     logger.info(f"Deleted short link: {item_id}")
     return {"success": True}
+
+
+@app.put("/api/links/{item_id}", status_code=200)
+async def update_link(item_id: str, payload: LinkUpdate):
+    """Update target URL for an existing short link item.
+
+    Uses a safe replace flow (delete old item, recreate with same slug/new target).
+    If recreate fails, attempts to restore the original mapping.
+    """
+    _validate_cf_id(item_id, "item_id")
+    if not config.short_domain:
+        raise HTTPException(status_code=400, detail="Short domain not configured")
+    list_id = await get_list_id()
+    if not list_id:
+        raise HTTPException(404, "Shortlink list not found")
+
+    data = await cf_request(
+        "GET",
+        f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
+        params={"per_page": 500},
+    )
+    items = data.get("result", [])
+    existing = next((i for i in items if i.get("id") == item_id), None)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Short link item not found")
+
+    source_url = str((existing.get("redirect") or {}).get("source_url", ""))
+    old_target = str((existing.get("redirect") or {}).get("target_url", ""))
+    slug = source_url.replace(f"https://{config.short_domain}/", "", 1).strip("/")
+    if not slug:
+        raise HTTPException(status_code=400, detail="Could not resolve slug for this item")
+
+    # Step 1: remove old mapping
+    await cf_request(
+        "DELETE",
+        f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
+        json={"items": [{"id": item_id}]},
+    )
+
+    try:
+        # Step 2: create updated mapping
+        await cf_request(
+            "POST",
+            f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
+            json=[{
+                "redirect": {
+                    "source_url": f"https://{config.short_domain}/{slug}",
+                    "target_url": payload.target,
+                    "status_code": 301,
+                },
+            }],
+        )
+        logger.info(f"Updated short link: /{slug} → {payload.target}")
+        return {"success": True, "slug": slug}
+    except HTTPException:
+        # Best-effort restore to previous target
+        try:
+            await cf_request(
+                "POST",
+                f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
+                json=[{
+                    "redirect": {
+                        "source_url": f"https://{config.short_domain}/{slug}",
+                        "target_url": old_target,
+                        "status_code": 301,
+                    },
+                }],
+            )
+        except Exception as restore_err:
+            logger.error(f"Failed to restore short link /{slug} after update error: {restore_err}")
+        raise
 
 
 # ── DNS Records ───────────────────────────────────────────────────────────────
@@ -1240,6 +1379,35 @@ async def list_proxy_hosts():
     return await npm_request("GET", "/api/nginx/proxy-hosts")
 
 
+@app.get("/api/npm/certificates")
+async def list_npm_certificates():
+    """List certificates in NPM.
+
+    Used by the Settings UI to help pick a wildcard certificate ID.
+    """
+    return await npm_request("GET", "/api/nginx/certificates")
+
+
+@app.get("/api/npm/certificates/auto")
+async def auto_detect_npm_wildcard_cert():
+    """Auto-detect the wildcard certificate ID for *.DOMAIN in NPM."""
+    if not config.domain:
+        raise HTTPException(status_code=400, detail="Base domain not configured")
+
+    wildcard = f"*.{config.domain}".lower()
+    certs = await npm_request("GET", "/api/nginx/certificates")
+    for c in certs:
+        domains = [str(x).lower() for x in (c.get("domain_names") or [])]
+        if wildcard in domains:
+            return {
+                "found": True,
+                "cert_id": c.get("id"),
+                "domain": wildcard,
+                "certificate": c,
+            }
+    return {"found": False, "cert_id": None, "domain": wildcard}
+
+
 @app.get("/api/scan")
 async def scan():
     """Cross-reference Cloudflare DNS A records with NPM proxy hosts.
@@ -1306,6 +1474,8 @@ async def scan():
         "unmatched_dns":   unmatched_dns,
         "passthrough_dns": passthrough_dns,
         "npm_host":        config.npm_host,   # for frontend use in "Add DNS" action
+        "uptime_kuma_url": config.uptime_kuma_url,
+        "homepage_url":    config.homepage_url,
     }
 
 
@@ -1346,6 +1516,37 @@ class ServiceCreate(BaseModel):
         if not 1 <= v <= 65535:
             raise ValueError("Port must be between 1 and 65535")
         return v
+
+
+class ServiceDelete(BaseModel):
+    proxy_host_id: int
+    domain: str
+    dns_record_id: str | None = None
+
+    @field_validator("proxy_host_id")
+    @classmethod
+    def validate_proxy_host_id(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("proxy_host_id must be > 0")
+        return v
+
+    @field_validator("domain")
+    @classmethod
+    def validate_domain(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not v:
+            raise ValueError("domain cannot be empty")
+        return v
+
+
+class ServiceEnabledUpdate(BaseModel):
+    enabled: bool
+
+
+class ServiceBatchRequest(BaseModel):
+    items: list[ServiceCreate]
+    dry_run: bool = True
+    continue_on_error: bool = False
 
 
 @app.post("/api/services", status_code=201)
@@ -1425,6 +1626,127 @@ async def create_service(svc: ServiceCreate):
         "dns_id":  dns_record_id,
         "backend": f"{svc.forward_scheme}://{svc.forward_host}:{svc.forward_port}",
     }
+
+
+@app.post("/api/services/batch", status_code=200)
+async def batch_services(payload: ServiceBatchRequest):
+    """Batch create services with optional dry-run preview."""
+    if not payload.items:
+        raise HTTPException(status_code=400, detail="No items provided")
+
+    # Gather existing domains for conflict warnings in dry-run.
+    cf_data, npm_hosts = await asyncio.gather(
+        cf_request(
+            "GET",
+            f"/zones/{config.cf_zone_id}/dns_records",
+            params={"per_page": 100, "order": "name", "type": "A"},
+        ),
+        npm_request("GET", "/api/nginx/proxy-hosts"),
+    )
+    existing_dns = {r.get("name") for r in cf_data.get("result", [])}
+    existing_npm = {((h.get("domain_names") or [None])[0]) for h in npm_hosts}
+
+    plan: list[dict[str, Any]] = []
+    for item in payload.items:
+        domain = f"{item.subdomain}.{config.domain}"
+        warnings: list[str] = []
+        if domain in existing_dns:
+            warnings.append("DNS record already exists")
+        if domain in existing_npm:
+            warnings.append("NPM proxy host already exists")
+        plan.append({
+            "domain": domain,
+            "backend": f"{item.forward_scheme}://{item.forward_host}:{item.forward_port}",
+            "warnings": warnings,
+        })
+
+    if payload.dry_run:
+        return {"success": True, "dry_run": True, "plan": plan}
+
+    created: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for item in payload.items:
+        try:
+            res = await create_service(item)
+            created.append(res)
+        except HTTPException as e:
+            failed.append({
+                "domain": f"{item.subdomain}.{config.domain}",
+                "error": str(e.detail),
+                "status_code": e.status_code,
+            })
+            if not payload.continue_on_error:
+                break
+
+    return {
+        "success": len(failed) == 0,
+        "dry_run": False,
+        "created": created,
+        "failed": failed,
+    }
+
+
+@app.post("/api/services/delete", status_code=200)
+async def delete_service(payload: ServiceDelete):
+    """Delete service in one action: NPM proxy host + matching Cloudflare DNS A record."""
+    npm_deleted = False
+    dns_deleted = False
+    dns_target_id = payload.dns_record_id
+
+    # Step 1: delete proxy host
+    await npm_request("DELETE", f"/api/nginx/proxy-hosts/{payload.proxy_host_id}")
+    npm_deleted = True
+
+    # Step 2: delete DNS record (by explicit ID or best-effort lookup by domain+npm_host)
+    if dns_target_id:
+        _validate_cf_id(dns_target_id, "dns_record_id")
+    else:
+        cf_data = await cf_request(
+            "GET",
+            f"/zones/{config.cf_zone_id}/dns_records",
+            params={"name": payload.domain, "type": "A", "per_page": 10},
+        )
+        for rec in cf_data.get("result", []):
+            if rec.get("name") == payload.domain and rec.get("content") == config.npm_host:
+                dns_target_id = rec.get("id")
+                break
+
+    if dns_target_id:
+        await cf_request("DELETE", f"/zones/{config.cf_zone_id}/dns_records/{dns_target_id}")
+        dns_deleted = True
+
+    logger.info(
+        f"Deleted service: domain={payload.domain}, proxy_host_id={payload.proxy_host_id}, "
+        f"npm_deleted={npm_deleted}, dns_deleted={dns_deleted}"
+    )
+    return {
+        "success": True,
+        "proxy_deleted": npm_deleted,
+        "dns_deleted": dns_deleted,
+    }
+
+
+@app.post("/api/services/{proxy_host_id}/enabled", status_code=200)
+async def set_service_enabled(proxy_host_id: int, payload: ServiceEnabledUpdate):
+    """Enable/disable an existing NPM proxy host."""
+    if proxy_host_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid proxy_host_id")
+
+    hosts = await npm_request("GET", "/api/nginx/proxy-hosts")
+    host = next((h for h in hosts if int(h.get("id", -1)) == proxy_host_id), None)
+    if not host:
+        raise HTTPException(status_code=404, detail="Proxy host not found")
+
+    update_body = dict(host)
+    update_body["enabled"] = payload.enabled
+
+    # Remove fields that can cause update rejections on some NPM versions.
+    for field in ("created_on", "modified_on", "owner", "owner_user"):
+        update_body.pop(field, None)
+
+    result = await npm_request("PUT", f"/api/nginx/proxy-hosts/{proxy_host_id}", json=update_body)
+    logger.info(f"Set proxy host {proxy_host_id} enabled={payload.enabled}")
+    return {"success": True, "proxy_host": result}
 
 
 # ── Frontend (catch-all) ──────────────────────────────────────────────────────

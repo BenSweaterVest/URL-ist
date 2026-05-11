@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>PenguinNest Console</title>
+<title>URLer</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Azeret+Mono:wght@300;400;500&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -185,6 +185,19 @@ const { useState, useEffect, useCallback } = React;
 
 let CSRF_TOKEN = '';
 
+const configTestPayload = (form) => ({
+  cf_api_token:  form.cf_api_token,
+  cf_account_id: form.cf_account_id,
+  cf_zone_id:    form.cf_zone_id,
+  npm_url:       form.npm_url,
+  npm_email:     form.npm_email,
+  npm_password:  form.npm_password,
+  npm_cert_id:   form.npm_cert_id,
+  domain:        form.domain,
+  short_domain:  form.short_domain,
+  cf_list_name:  form.cf_list_name,
+});
+
 const api = async (method, path, body) => {
   let r;
   try {
@@ -276,7 +289,7 @@ function TestResults({ results }) {
 
 // ── Config form fields (shared by wizard and settings modal) ──────────────────
 
-function ConfigForm({ form, setField, consolePasswordOptional }) {
+function ConfigForm({ form, setField, consolePasswordOptional, toast }) {
   return (
     <>
       {/* Console login (wizard: required; settings: optional change) */}
@@ -355,6 +368,23 @@ function ConfigForm({ form, setField, consolePasswordOptional }) {
           <div className="field-hint">
             The certificate ID in NPM that covers *.yourdomain.com — find it in NPM → SSL Certificates → the cert ID shown in the URL when you click it
           </div>
+          <div style={{ marginTop: '10px', display: 'flex', gap: '8px' }}>
+            <button className="btn btn-ghost btn-sm" type="button" onClick={async () => {
+              try {
+                const r = await api('GET', '/api/npm/certificates/auto');
+                if (!r.found) {
+                  toast && toast(`No wildcard cert found for ${r.domain}.`, 'err');
+                  return;
+                }
+                setField('npm_cert_id', Number(r.cert_id) || 1);
+                toast && toast(`Detected wildcard cert ${r.domain} (id ${r.cert_id})`, 'ok');
+              } catch (e) {
+                toast && toast(e.message, 'err');
+              }
+            }}>
+              Auto-detect wildcard cert
+            </button>
+          </div>
         </div>
       </div>
 
@@ -379,6 +409,25 @@ function ConfigForm({ form, setField, consolePasswordOptional }) {
             <input type="text" placeholder="shortlinks" value={form.cf_list_name}
               onChange={e => setField('cf_list_name', e.target.value)} />
             <div className="field-hint">Cloudflare list name — alphanumeric and underscores only</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Integrations (optional) */}
+      <div className="wizard-section">
+        <div className="wizard-section-title">Integrations (optional)</div>
+        <div className="grid2">
+          <div className="field">
+            <label>Uptime Kuma URL</label>
+            <input type="text" placeholder="https://uptime.yourdomain.com" value={form.uptime_kuma_url || ''}
+              onChange={e => setField('uptime_kuma_url', e.target.value)} />
+            <div className="field-hint">Used for post-create reminders only.</div>
+          </div>
+          <div className="field">
+            <label>Homepage URL</label>
+            <input type="text" placeholder="https://home.yourdomain.com" value={form.homepage_url || ''}
+              onChange={e => setField('homepage_url', e.target.value)} />
+            <div className="field-hint">Used for post-create reminders only.</div>
           </div>
         </div>
       </div>
@@ -416,9 +465,9 @@ function LoginScreen({ onAuthed, toast }) {
     <div className="wizard-wrap">
       <div className="wizard" style={{ maxWidth: '420px' }}>
         <div className="wizard-brand">
-          <span className="wizard-brand-icon">🐧</span>
+          <span className="wizard-brand-icon">🔗</span>
           <div>
-            <div className="wizard-brand-title">PENGUINNEST CONSOLE</div>
+            <div className="wizard-brand-title">URLER</div>
             <div className="wizard-brand-sub">Sign in to continue</div>
           </div>
         </div>
@@ -449,6 +498,7 @@ const WIZARD_DEFAULTS = {
   npm_url: '', npm_email: '', npm_password: '',
   npm_cert_id: 2, domain: '',
   short_domain: '', cf_list_name: 'shortlinks',
+  uptime_kuma_url: '', homepage_url: '',
 };
 
 function WizardScreen({ onComplete, toast }) {
@@ -469,7 +519,7 @@ function WizardScreen({ onComplete, toast }) {
     setTesting(true);
     setTestResults(null);
     try {
-      const r = await api('POST', '/api/config/test', form);
+      const r = await api('POST', '/api/config/test', configTestPayload(form));
       setTestResults(r);
     } catch (e) {
       toast(e.message, 'err');
@@ -488,7 +538,7 @@ function WizardScreen({ onComplete, toast }) {
         const s = await r.json();
         CSRF_TOKEN = s.csrf_token || '';
       } catch { /* ignore */ }
-      toast('Configuration saved — welcome to PenguinNest Console!', 'ok');
+      toast('Configuration saved — welcome to URLer!', 'ok');
       toast('Tip: restart the container once to persist session signing across restarts.', 'ok');
       onComplete();
     } catch (e) {
@@ -502,14 +552,14 @@ function WizardScreen({ onComplete, toast }) {
     <div className="wizard-wrap">
       <div className="wizard">
         <div className="wizard-brand">
-          <span className="wizard-brand-icon">🐧</span>
+          <span className="wizard-brand-icon">🔗</span>
           <div>
-            <div className="wizard-brand-title">PENGUINNEST CONSOLE</div>
+            <div className="wizard-brand-title">URLER</div>
             <div className="wizard-brand-sub">First-run setup — enter your credentials to get started</div>
           </div>
         </div>
 
-        <ConfigForm form={form} setField={setField} consolePasswordOptional={false} />
+        <ConfigForm form={form} setField={setField} consolePasswordOptional={false} toast={toast} />
 
         {/* Test results appear after clicking "Test Connections" */}
         <TestResults results={testResults} />
@@ -561,7 +611,7 @@ function SettingsModal({ onClose, toast }) {
     setTesting(true);
     setTestResults(null);
     try {
-      const r = await api('POST', '/api/config/test', form);
+      const r = await api('POST', '/api/config/test', configTestPayload(form));
       setTestResults(r);
     } catch (e) {
       toast(e.message, 'err');
@@ -593,7 +643,7 @@ function SettingsModal({ onClose, toast }) {
 
   return (
     <Modal title="Settings" onClose={onClose} wide>
-      <ConfigForm form={form} setField={setField} consolePasswordOptional />
+      <ConfigForm form={form} setField={setField} consolePasswordOptional toast={toast} />
       <TestResults results={testResults} />
       <div className="modal-footer">
         <button className="btn btn-ghost" onClick={test} disabled={testing}>
@@ -616,6 +666,8 @@ function LinksPanel({ toast, onMutate }) {
   const [preflight, setPreflight] = useState(null);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
+  const [editItem, setEditItem] = useState(null);
+  const [editTarget, setEditTarget] = useState('');
   const [slug, setSlug]       = useState('');
   const [target, setTarget]   = useState('');
   const [saving, setSaving]   = useState(false);
@@ -654,6 +706,23 @@ function LinksPanel({ toast, onMutate }) {
       toast(`/${s} deleted`, 'ok');
       load(); onMutate();
     } catch (e) { toast(e.message, 'err'); }
+  };
+
+  const openEdit = (item, s) => {
+    setEditItem({ id: item.id, slug: s });
+    setEditTarget(item.redirect?.target_url || '');
+  };
+
+  const saveEdit = async () => {
+    if (!editItem || !editTarget) return;
+    setSaving(true);
+    try {
+      await api('PUT', `/api/links/${editItem.id}`, { target: editTarget });
+      toast(`/${editItem.slug} updated`, 'ok');
+      setEditItem(null); setEditTarget('');
+      load(); onMutate();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setSaving(false); }
   };
 
   const parseSlug = url => url?.replace(/^https?:\/\/[^/]+\//, '') || '';
@@ -718,7 +787,10 @@ function LinksPanel({ toast, onMutate }) {
                         <td><span className="slug">/{s}</span></td>
                         <td><div className="url-cell" title={t}>{t}</div></td>
                         <td className="td-actions">
-                          <button className="btn btn-danger btn-sm" onClick={() => del(item.id, s)}>✕</button>
+                          <span className="cell-action" style={{ justifyContent: 'flex-end' }}>
+                            <button className="btn btn-ghost btn-sm" onClick={() => openEdit(item, s)}>Edit</button>
+                            <button className="btn btn-danger btn-sm" onClick={() => del(item.id, s)}>✕</button>
+                          </span>
                         </td>
                       </tr>
                     );
@@ -756,6 +828,24 @@ function LinksPanel({ toast, onMutate }) {
           </div>
         </Modal>
       )}
+
+      {editItem && (
+        <Modal title={`Edit /${editItem.slug}`} onClose={() => setEditItem(null)}>
+          <div className="field">
+            <label>Destination URL</label>
+            <input type="text" placeholder="https://example.com" value={editTarget}
+              onChange={e => setEditTarget(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && saveEdit()} />
+            <div className="field-hint">Must start with https:// or http://</div>
+          </div>
+          <div className="modal-footer">
+            <button className="btn btn-ghost" onClick={() => setEditItem(null)}>Cancel</button>
+            <button className="btn btn-primary" onClick={saveEdit} disabled={saving || !editTarget}>
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </Modal>
+      )}
     </>
   );
 }
@@ -765,6 +855,7 @@ function LinksPanel({ toast, onMutate }) {
 
 function DNSPanel({ toast, onMutate }) {
   const [records, setRecords] = useState(null);
+  const [shortDomain, setShortDomain] = useState('');
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [name, setName]       = useState('');
@@ -774,7 +865,14 @@ function DNSPanel({ toast, onMutate }) {
 
   const load = useCallback(async () => {
     setLoading(true);
-    try { setRecords(await api('GET', '/api/dns')); }
+    try {
+      const [dns, cfg] = await Promise.all([
+        api('GET', '/api/dns'),
+        api('GET', '/api/config'),
+      ]);
+      setRecords(dns);
+      setShortDomain((cfg.short_domain || '').toLowerCase());
+    }
     catch (e) { toast(e.message, 'err'); }
     finally { setLoading(false); }
   }, [toast]);
@@ -796,7 +894,18 @@ function DNSPanel({ toast, onMutate }) {
     finally { setSaving(false); }
   };
 
+  const isShortRecord = (name) => {
+    if (!shortDomain) return false;
+    return (name || '').toLowerCase() === shortDomain;
+  };
+
   const del = async (id, n) => {
+    if (isShortRecord(n)) {
+      const second = prompt(
+        `This is your short-links domain record (${n}). Deleting it will break short links until restored.\n\nType DELETE to confirm.`,
+      );
+      if (second !== 'DELETE') return;
+    }
     if (!confirm(`Delete DNS record for ${n}?`)) return;
     try {
       await api('DELETE', `/api/dns/${id}`);
@@ -825,7 +934,12 @@ function DNSPanel({ toast, onMutate }) {
             <tbody>
               {records.map(r => (
                 <tr key={r.id}>
-                  <td><span className="mono">{r.name}</span></td>
+                  <td>
+                    <span className="mono">{r.name}</span>
+                    {isShortRecord(r.name) && (
+                      <span className="badge badge-warn" style={{ marginLeft: '8px' }}>short-domain</span>
+                    )}
+                  </td>
                   <td><span className="ip-cell">{r.content}</span></td>
                   <td><span className={`badge ${r.proxied ? 'badge-blue' : 'badge-gray'}`}>
                     {r.proxied ? 'proxied' : 'dns only'}
@@ -892,9 +1006,17 @@ function ServicesPanel({ toast, onMutate }) {
   const [scan, setScan]           = useState(null);
   const [loading, setLoading]     = useState(true);
   const [showAdd, setShowAdd]     = useState(false);
+  const [showBatch, setShowBatch] = useState(false);
+  const [created, setCreated]     = useState(null);
   const [form, setForm]           = useState(EMPTY_FORM);
   const [saving, setSaving]       = useState(false);
   const [fixingDns, setFixingDns] = useState(null);
+  const [actingHost, setActingHost] = useState(null);
+  const [batchText, setBatchText] = useState(`[
+  {"subdomain":"app1","forward_host":"10.0.0.209","forward_port":8080,"forward_scheme":"http","websocket":false,"ssl_verify_off":false}
+]`);
+  const [batchPlan, setBatchPlan] = useState(null);
+  const [batchContinue, setBatchContinue] = useState(false);
 
   const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
@@ -913,6 +1035,7 @@ function ServicesPanel({ toast, onMutate }) {
     try {
       const res = await api('POST', '/api/services', { ...form, forward_port: Number(form.forward_port) });
       toast(`${res.domain} created`, 'ok');
+      setCreated(res);
       setShowAdd(false); setForm(EMPTY_FORM);
       load(); onMutate();
     } catch (e) { toast(e.message, 'err'); }
@@ -932,6 +1055,72 @@ function ServicesPanel({ toast, onMutate }) {
     finally { setFixingDns(null); }
   };
 
+  const toggleEnabled = async (host) => {
+    const domain = host.domain_names?.[0] || `#${host.id}`;
+    setActingHost(host.id);
+    try {
+      await api('POST', `/api/services/${host.id}/enabled`, { enabled: !host.enabled });
+      toast(`${domain} ${host.enabled ? 'disabled' : 'enabled'}`, 'ok');
+      load(); onMutate();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setActingHost(null); }
+  };
+
+  const deleteService = async (serviceEntry) => {
+    const host = serviceEntry.proxy_host;
+    const domain = host.domain_names?.[0];
+    if (!domain) return;
+    if (!confirm(`Delete service ${domain}?\n\nThis removes both the NPM proxy host and the matching DNS record.`)) return;
+
+    setActingHost(host.id);
+    try {
+      await api('POST', '/api/services/delete', {
+        proxy_host_id: host.id,
+        domain,
+        dns_record_id: serviceEntry.dns_record?.id || null,
+      });
+      toast(`${domain} deleted`, 'ok');
+      load(); onMutate();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setActingHost(null); }
+  };
+
+  const parseBatch = () => {
+    try {
+      const data = JSON.parse(batchText);
+      if (!Array.isArray(data)) throw new Error('Batch JSON must be an array');
+      return data;
+    } catch (e) {
+      throw new Error(`Invalid JSON: ${e.message}`);
+    }
+  };
+
+  const previewBatch = async () => {
+    try {
+      const items = parseBatch();
+      const res = await api('POST', '/api/services/batch', { items, dry_run: true, continue_on_error: batchContinue });
+      setBatchPlan(res.plan || []);
+      toast(`Preview ready (${(res.plan || []).length} items)`, 'ok');
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  };
+
+  const runBatch = async () => {
+    try {
+      const items = parseBatch();
+      const res = await api('POST', '/api/services/batch', { items, dry_run: false, continue_on_error: batchContinue });
+      const ok = (res.created || []).length;
+      const bad = (res.failed || []).length;
+      toast(`Batch finished: ${ok} created, ${bad} failed`, bad ? 'err' : 'ok');
+      setShowBatch(false);
+      setBatchPlan(null);
+      load(); onMutate();
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  };
+
   const services      = scan?.services        || [];
   const unmatchedDns  = scan?.unmatched_dns   || [];
   const passthroughDns = scan?.passthrough_dns || [];
@@ -943,7 +1132,10 @@ function ServicesPanel({ toast, onMutate }) {
           <div className="panel-title">Services</div>
           <div className="panel-desc">NPM proxy hosts × Cloudflare DNS health</div>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowAdd(true)}>+ New Service</button>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button className="btn btn-ghost" onClick={() => setShowBatch(true)}>Batch Import</button>
+          <button className="btn btn-primary" onClick={() => setShowAdd(true)}>+ New Service</button>
+        </div>
       </div>
 
       {/* Main services table */}
@@ -953,9 +1145,10 @@ function ServicesPanel({ toast, onMutate }) {
       : (
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Domain</th><th>Backend</th><th>DNS</th><th>SSL</th><th>WS</th><th>Status</th></tr></thead>
+            <thead><tr><th>Domain</th><th>Backend</th><th>DNS</th><th>SSL</th><th>WS</th><th>Status</th><th></th></tr></thead>
             <tbody>
-              {services.map(({ proxy_host: h, status }) => {
+              {services.map((serviceEntry) => {
+                const { proxy_host: h, status } = serviceEntry;
                 const domain = h.domain_names?.[0];
                 return (
                   <tr key={h.id}>
@@ -977,6 +1170,24 @@ function ServicesPanel({ toast, onMutate }) {
                     <td>{h.certificate_id > 0 ? <span className="badge badge-green">ssl</span> : <span className="badge badge-gray">none</span>}</td>
                     <td>{h.allow_websocket_upgrade ? <span className="badge badge-blue">ws</span> : <span className="badge badge-gray">—</span>}</td>
                     <td>{h.enabled ? <span className="badge badge-green">● online</span> : <span className="badge badge-gray">● off</span>}</td>
+                    <td className="td-actions">
+                      <span className="cell-action" style={{ justifyContent: 'flex-end' }}>
+                        <button
+                          className="btn btn-ghost btn-sm"
+                          onClick={() => toggleEnabled(h)}
+                          disabled={actingHost === h.id}
+                        >
+                          {actingHost === h.id ? '…' : (h.enabled ? 'Disable' : 'Enable')}
+                        </button>
+                        <button
+                          className="btn btn-danger btn-sm"
+                          onClick={() => deleteService(serviceEntry)}
+                          disabled={actingHost === h.id}
+                        >
+                          Delete
+                        </button>
+                      </span>
+                    </td>
                   </tr>
                 );
               })}
@@ -1080,6 +1291,77 @@ function ServicesPanel({ toast, onMutate }) {
           </div>
         </Modal>
       )}
+
+      {showBatch && (
+        <Modal title="Batch Import Services" onClose={() => { setShowBatch(false); setBatchPlan(null); }} wide>
+          <div className="field">
+            <label>JSON Array</label>
+            <textarea
+              value={batchText}
+              onChange={e => setBatchText(e.target.value)}
+              style={{ width: '100%', minHeight: '180px', background: 'var(--bg)', border: '1px solid var(--border2)', color: 'var(--text)', borderRadius: 'var(--radius)', padding: '10px', fontFamily: 'var(--mono)', fontSize: '12px' }}
+            />
+            <div className="field-hint">Each item uses the same fields as New Service: subdomain, forward_host, forward_port, forward_scheme, websocket, ssl_verify_off.</div>
+          </div>
+          <div className="field">
+            <label className="check-row label-plain">
+              <input type="checkbox" checked={batchContinue} onChange={e => setBatchContinue(e.target.checked)} />
+              <span>Continue on error (otherwise stop at first failure)</span>
+            </label>
+          </div>
+          {batchPlan && (
+            <div className="table-wrap" style={{ marginTop: '10px' }}>
+              <table>
+                <thead><tr><th>Domain</th><th>Backend</th><th>Warnings</th></tr></thead>
+                <tbody>
+                  {batchPlan.map((p, idx) => (
+                    <tr key={`${p.domain}-${idx}`}>
+                      <td><span className="mono">{p.domain}</span></td>
+                      <td><span className="ip-cell">{p.backend}</span></td>
+                      <td>{(p.warnings || []).length ? <span className="badge badge-warn">{p.warnings.join(', ')}</span> : <span className="badge badge-green">ok</span>}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div className="modal-footer">
+            <button className="btn btn-ghost" onClick={previewBatch}>Preview</button>
+            <button className="btn btn-primary" onClick={runBatch}>Run Import</button>
+          </div>
+        </Modal>
+      )}
+
+      {created && (
+        <Modal title="Service created" onClose={() => setCreated(null)} wide>
+          <div className="field-hint" style={{ marginBottom: '12px' }}>
+            <div style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{created.domain}</div>
+            <div style={{ marginTop: '6px' }}>Backend: <span className="mono">{created.backend}</span></div>
+            <div style={{ marginTop: '6px' }}>URL: <span className="mono">https://{created.domain}</span></div>
+          </div>
+
+          <div className="section-label">Optional checklist</div>
+          <div className="field-hint">
+            □ Add an Uptime Kuma monitor for <span className="mono">https://{created.domain}</span>
+              {scan?.uptime_kuma_url ? <> — <a href={scan.uptime_kuma_url} target="_blank" rel="noreferrer" className="mono">open</a></> : null}
+              <br/>
+            □ Add a tile/link in Homepage for <span className="mono">{created.domain}</span>
+              {scan?.homepage_url ? <> — <a href={scan.homepage_url} target="_blank" rel="noreferrer" className="mono">open</a></> : null}
+              <br/>
+            □ If this is a new app: complete its first-run wizard and change default credentials
+          </div>
+
+          <div className="modal-footer">
+            <button className="btn btn-ghost" onClick={() => {
+              navigator.clipboard?.writeText(`https://${created.domain}`).then(
+                () => toast('Copied URL', 'ok'),
+                () => toast('Copy failed', 'err')
+              );
+            }}>Copy URL</button>
+            <button className="btn btn-primary" onClick={() => setCreated(null)}>Done</button>
+          </div>
+        </Modal>
+      )}
     </>
   );
 }
@@ -1175,10 +1457,10 @@ function App() {
   return (
     <>
       <header className="header">
-        <span className="header-logo">🐧</span>
+        <span className="header-logo">🔗</span>
         <div>
-          <div className="header-title">PENGUINNEST</div>
-          <div className="header-sub">CONSOLE</div>
+          <div className="header-title">URLER</div>
+          <div className="header-sub">console</div>
         </div>
         <div className="header-spacer" />
         <div className="header-status">

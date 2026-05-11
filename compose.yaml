@@ -1,4 +1,4 @@
-# PenguinNest Console — Docker Compose
+# URLer — Docker Compose
 # ======================================
 # Unified management console for short links, DNS records, and NPM services.
 # Deploy on your Docker host; expose internally via your reverse proxy.
@@ -31,14 +31,14 @@
 #   Account > Account Rulesets > Edit        (Tofu bootstrap only)
 
 services:
-  urlconsole:
+  urler:
     build: .
-    container_name: urlconsole
+    container_name: urler
     restart: unless-stopped
     ports:
       - "8099:8000"
     volumes:
-      - urlconsole_data:/data   # persists config.json across container restarts
+      - urler_data:/data   # persists config.json across container restarts
 
     # Uncomment ONE environment block below. For production, set SESSION_SECRET
     # (e.g. openssl rand -hex 32) so login cookies cannot be forged.
@@ -63,6 +63,7 @@ services:
     #   CF_LIST_NAME:  "shortlinks"               # must be alphanumeric + underscores
     #   NPM_CERT_ID:   "2"         # wildcard cert ID in NPM
     #   CONSOLE_PASSWORD: ""       # optional plaintext console login when using env-only bootstrap
+    #   CONFIG_HISTORY_LIMIT: "100" # keep last N config snapshots in /data/config-versions (0 disables)
 
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
@@ -72,7 +73,7 @@ services:
       start_period: 15s
 
 volumes:
-  urlconsole_data:
+  urler_data:
     # Config is stored in a named Docker volume by default.
     # To use a host path instead (easier to inspect/back up), replace with:
     #   driver: local

@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from starlette.testclient import TestClient
 
-_cfg_dir = Path(tempfile.mkdtemp(prefix="urlist_test_"))
+_cfg_dir = Path(tempfile.mkdtemp(prefix="penguinnest_console_test_"))
 _cfg_path = _cfg_dir / "config.json"
 _cfg_path.write_text("{}", encoding="utf-8")
 os.environ["CONFIG_FILE"] = str(_cfg_path)
@@ -58,3 +58,18 @@ def configured_client(client: TestClient) -> TestClient:
     assert r_cfg.status_code == 200, r_cfg.text
     assert client.post("/api/auth/login", json={"password": "testpass12"}).status_code == 200
     return client
+
+
+@pytest.fixture
+def csrf_token(configured_client: TestClient) -> str:
+    """CSRF token for authenticated unsafe requests in tests."""
+    r = configured_client.get("/api/auth/status")
+    assert r.status_code == 200, r.text
+    token = r.json().get("csrf_token", "")
+    assert token, "csrf_token missing from /api/auth/status after login"
+    return str(token)
+
+
+@pytest.fixture
+def csrf_headers(csrf_token: str) -> dict[str, str]:
+    return {"X-CSRF-Token": csrf_token}

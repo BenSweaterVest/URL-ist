@@ -1,4 +1,4 @@
-# PenguinNest Console — Container Image
+# URLer — Container Image
 # =======================================
 # Single-container app: FastAPI backend + React SPA served as static files.
 # No separate frontend build step — the SPA uses React via CDN and Babel
