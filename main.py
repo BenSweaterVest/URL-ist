@@ -36,7 +36,8 @@ Optional fields (env var names shown, built-in defaults listed):
   CONSOLE_PASSWORD Plaintext console password for env-only bootstrap; first login
                    persists a hash to config.json (see README).
   SESSION_COOKIE_HTTPS_ONLY  If 1/true, session cookies are not sent over plain HTTP.
-  ALLOW_INSECURE_SESSION     If 1/true, allow startup with weak session signing (dev only).
+  SESSION_COOKIE_SAMESITE    Cookie SameSite: lax|strict|none  (default: lax)
+  TRUST_PROXY_HEADERS        If 1/true, trust X-Forwarded-For for rate limiting (only behind a trusted proxy).
 
 Manages three resource types:
   Links      Cloudflare Bulk Redirect list items (SHORT_DOMAIN/*)
@@ -52,7 +53,6 @@ import logging
 import os
 import re
 import secrets
-import sys
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -75,7 +75,11 @@ CF_BASE     = "https://api.cloudflare.com/client/v4"
 MASK_CHAR   = "•"   # used to mask secrets in GET /api/config responses
 CONFIG_FILE = Path(os.environ.get("CONFIG_FILE", "/data/config.json"))
 
-_DEV_SESSION_FALLBACK = "urlist-dev-session-secret-not-for-production-use"
+# If neither SESSION_SECRET nor config.json provides a secret, we use a per-process
+# random key. This is secure (not guessable), but sessions will be invalidated on
+# restart. Persisting session_secret via the wizard (or setting SESSION_SECRET)
+# avoids that.
+_RUNTIME_SESSION_SECRET = secrets.token_hex(32)
 
 # Login brute-force mitigation (per client IP, in-process — reset on restart).
 _LOGIN_RATE_WINDOW_SEC = 60.0
@@ -93,7 +97,7 @@ def _hash_console_password(password: str) -> str:
     key = hashlib.scrypt(
         password.encode(),
         salt=salt,
-        n=2**14,
+        n=2**15,
         r=8,
         p=1,
         dklen=32,
@@ -112,7 +116,7 @@ def _verify_console_password(password: str, stored: str) -> bool:
         key = hashlib.scrypt(
             password.encode(),
             salt=salt,
-            n=2**14,
+            n=2**15,
             r=8,
             p=1,
             dklen=32,
@@ -123,7 +127,7 @@ def _verify_console_password(password: str, stored: str) -> bool:
 
 
 def _session_secret_sources() -> tuple[str, str]:
-    """Return (secret, source) where source is 'env', 'file', or 'fallback'."""
+    """Return (secret, source) where source is 'env', 'file', or 'runtime'."""
     env = os.environ.get("SESSION_SECRET", "").strip()
     if len(env) >= 16:
         return env, "env"
@@ -135,23 +139,25 @@ def _session_secret_sources() -> tuple[str, str]:
                 return fs, "file"
         except (OSError, json.JSONDecodeError, TypeError):
             pass
-    return _DEV_SESSION_FALLBACK, "fallback"
+    return _RUNTIME_SESSION_SECRET, "runtime"
 
 
 def _session_secret() -> str:
     """Secret for SessionMiddleware — env first, then optional key in config.json."""
     secret, source = _session_secret_sources()
-    if source == "fallback":
+    if source == "runtime":
         logger.warning(
             "SESSION_SECRET is not set (or too short) and no session_secret in config.json — "
-            "using a built-in development key. Set SESSION_SECRET or persist session_secret."
+            "using a per-process random session key (sessions will reset on restart). "
+            "Complete the wizard to persist session_secret or set SESSION_SECRET."
         )
     return secret
 
 
 def _session_signing_is_secure() -> bool:
-    """True when not using the baked-in development session key."""
-    return _session_secret_sources()[1] != "fallback"
+    """True when session cookies are not signed by a public/guessable key."""
+    # All sources are acceptable; 'runtime' is still secure (random) but ephemeral.
+    return True
 
 
 def _ensure_session_secret_in_config(config_data: dict[str, Any], prior: dict[str, Any]) -> None:
@@ -178,6 +184,14 @@ def _session_cookie_https_only() -> bool:
     )
 
 
+def _session_cookie_same_site() -> str:
+    raw = os.environ.get("SESSION_COOKIE_SAMESITE", "lax").strip().lower()
+    if raw in ("lax", "strict", "none"):
+        return raw
+    logger.warning(f"Invalid SESSION_COOKIE_SAMESITE={raw!r}; using 'lax'")
+    return "lax"
+
+
 def _record_login_attempt(client_ip: str) -> None:
     """Raise 429 when too many login attempts from this IP in the sliding window."""
     now = time.monotonic()
@@ -189,6 +203,45 @@ def _record_login_attempt(client_ip: str) -> None:
             detail="Too many login attempts — try again in a minute.",
         )
     bucket.append(now)
+
+
+def _trust_proxy_headers() -> bool:
+    """Trust X-Forwarded-For only when explicitly enabled."""
+    return os.environ.get("TRUST_PROXY_HEADERS", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP for rate limiting.
+
+    If TRUST_PROXY_HEADERS is enabled, uses the first IP in X-Forwarded-For.
+    Otherwise falls back to request.client.host (often the reverse proxy IP).
+    """
+    if _trust_proxy_headers():
+        xff = request.headers.get("x-forwarded-for", "")
+        if xff:
+            first = xff.split(",")[0].strip()
+            if first:
+                return first
+    return request.client.host if request.client else "unknown"
+
+
+def _csrf_token(request: Request) -> str:
+    """Return the per-session CSRF token (generating one if missing)."""
+    token = request.session.get("csrf_token")
+    if not token:
+        token = secrets.token_hex(16)
+        request.session["csrf_token"] = token
+    return str(token)
+
+
+def _require_csrf(request: Request) -> None:
+    """Enforce CSRF header for unsafe methods once authenticated."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return
+    header = request.headers.get("x-csrf-token", "")
+    expected = str(request.session.get("csrf_token", ""))
+    if not expected or not header or not secrets.compare_digest(header, expected):
+        raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
 
 
 def _login_required() -> bool:
@@ -278,6 +331,10 @@ _list_id_cache: str | None = None
 # credential change in settings takes effect within the hour.
 _npm_token:         str | None = None
 _npm_token_expires: float      = 0.0
+
+# Shared HTTP clients (connection pooling). Initialized in lifespan.
+_cf_client:  httpx.AsyncClient | None = None
+_npm_client: httpx.AsyncClient | None = None
 
 
 # ── Config loading ─────────────────────────────────────────────────────────────
@@ -375,23 +432,11 @@ def _resolve(proposed: str, current: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load config, log startup state, verify Cloudflare if configured."""
+    global _cf_client, _npm_client
     _load_config()
+    _cf_client  = httpx.AsyncClient(timeout=10.0)
+    _npm_client = httpx.AsyncClient(timeout=10.0)
     logger.info("PenguinNest Console starting")
-    if _login_required() and not _session_signing_is_secure():
-        allow = os.environ.get("ALLOW_INSECURE_SESSION", "").strip().lower() in ("1", "true", "yes", "on")
-        if allow:
-            logger.critical(
-                "ALLOW_INSECURE_SESSION is enabled — session cookies use a weak signing key. "
-                "Remove this flag for production."
-            )
-        else:
-            logger.critical(
-                "Console login is enabled but session signing is not configured securely. "
-                "Set SESSION_SECRET (>=16 chars) in the environment, add session_secret to "
-                "config.json (saved automatically on first wizard save), or set "
-                "ALLOW_INSECURE_SESSION=1 only for local development."
-            )
-            sys.exit(1)
     if config.is_configured():
         logger.info(f"  Domain:       {config.domain}")
         logger.info(f"  Short domain: {config.short_domain}")
@@ -409,6 +454,10 @@ async def lifespan(app: FastAPI):
         logger.warning(f"  Not configured — missing: {', '.join(config.missing_fields())}")
         logger.warning("  Open http://localhost:8000 in your browser to complete setup.")
     yield
+    if _cf_client:
+        await _cf_client.aclose()
+    if _npm_client:
+        await _npm_client.aclose()
     logger.info("PenguinNest Console shutting down")
 
 
@@ -417,7 +466,7 @@ app.add_middleware(
     SessionMiddleware,
     secret_key=_session_secret(),
     max_age=14 * 24 * 3600,
-    same_site="lax",
+    same_site=_session_cookie_same_site(),
     https_only=_session_cookie_https_only(),
 )
 
@@ -457,6 +506,11 @@ async def security_gate(request: Request, call_next):
             content={"detail": "Not authenticated"},
         )
 
+    try:
+        _require_csrf(request)
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+
     return await call_next(request)
 
 
@@ -471,23 +525,25 @@ async def cf_request(method: str, path: str, **kwargs) -> Any:
     on write operations.
     """
     url = f"{CF_BASE}{path}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    if not _cf_client:
+        raise HTTPException(status_code=503, detail="HTTP client not initialized")
+    try:
+        r = await _cf_client.request(method, url, headers=config.cf_headers, **kwargs)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
         try:
-            r = await client.request(method, url, headers=config.cf_headers, **kwargs)
-            r.raise_for_status()
-            return r.json()
-        except httpx.HTTPStatusError as e:
-            try:
-                body   = e.response.json()
-                errors = body.get("errors", [])
-                msg    = errors[0]["message"] if errors else e.response.text
-            except Exception:
-                msg = e.response.text
-            logger.error(f"Cloudflare {method} {path} → {e.response.status_code}: {msg}")
-            raise HTTPException(status_code=e.response.status_code, detail=f"Cloudflare: {msg}")
-        except httpx.RequestError as e:
-            logger.error(f"Cloudflare unreachable: {e}")
-            raise HTTPException(status_code=503, detail=f"Cannot reach Cloudflare: {str(e)}")
+            body   = e.response.json()
+            errors = body.get("errors", [])
+            msg    = errors[0]["message"] if errors else e.response.text
+        except Exception:
+            msg = e.response.text
+        logger.error(f"Cloudflare {method} {path} → {e.response.status_code}: {msg}")
+        # Return a safe, operator-friendly message to the SPA (log has detail).
+        raise HTTPException(status_code=e.response.status_code, detail="Cloudflare request failed")
+    except httpx.RequestError as e:
+        logger.error(f"Cloudflare unreachable: {e}")
+        raise HTTPException(status_code=503, detail=f"Cannot reach Cloudflare: {str(e)}")
 
 
 async def get_list_id() -> str | None:
@@ -520,23 +576,23 @@ async def get_npm_token() -> str:
     if _npm_token and now < _npm_token_expires:
         return _npm_token
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            r = await client.post(
-                f"{config.npm_url.rstrip('/')}/api/tokens",
-                json={"identity": config.npm_email, "secret": config.npm_password},
-            )
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=502, detail=f"NPM authentication failed: {e.response.text}")
-        except httpx.RequestError as e:
-            raise HTTPException(status_code=503, detail=f"Cannot reach NPM at {config.npm_url}: {str(e)}")
-        # Response body is buffered; r.json() is safe to call inside the block.
-        token = r.json().get("token")
-        if not token:
-            raise HTTPException(status_code=502, detail="NPM returned success but no token in response")
-        _npm_token         = token
-        _npm_token_expires = now + 3600
+    if not _npm_client:
+        raise HTTPException(status_code=503, detail="HTTP client not initialized")
+    try:
+        r = await _npm_client.post(
+            f"{config.npm_url.rstrip('/')}/api/tokens",
+            json={"identity": config.npm_email, "secret": config.npm_password},
+        )
+        r.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"NPM authentication failed (HTTP {e.response.status_code})")
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Cannot reach NPM at {config.npm_url}: {str(e)}")
+    token = r.json().get("token")
+    if not token:
+        raise HTTPException(status_code=502, detail="NPM returned success but no token in response")
+    _npm_token         = token
+    _npm_token_expires = now + 3600
 
     logger.info("NPM token refreshed")
     return token  # local var; _npm_token (global) is also set for cache use
@@ -550,25 +606,26 @@ async def npm_request(method: str, path: str, **kwargs) -> Any:
     """
     token = await get_npm_token()
     url   = f"{config.npm_url.rstrip('/')}{path}"
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    if not _npm_client:
+        raise HTTPException(status_code=503, detail="HTTP client not initialized")
+    try:
+        r = await _npm_client.request(
+            method, url,
+            headers={"Authorization": f"Bearer {token}"},
+            **kwargs,
+        )
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
         try:
-            r = await client.request(
-                method, url,
-                headers={"Authorization": f"Bearer {token}"},
-                **kwargs,
-            )
-            r.raise_for_status()
-            return r.json()
-        except httpx.HTTPStatusError as e:
-            try:
-                msg = e.response.json().get("error", e.response.text)
-            except Exception:
-                msg = e.response.text
-            logger.error(f"NPM {method} {path} → {e.response.status_code}: {msg}")
-            raise HTTPException(status_code=e.response.status_code, detail=f"NPM: {msg}")
-        except httpx.RequestError as e:
-            logger.error(f"NPM unreachable: {e}")
-            raise HTTPException(status_code=503, detail=f"Cannot reach NPM at {config.npm_url}: {str(e)}")
+            msg = e.response.json().get("error", e.response.text)
+        except Exception:
+            msg = e.response.text
+        logger.error(f"NPM {method} {path} → {e.response.status_code}: {msg}")
+        raise HTTPException(status_code=e.response.status_code, detail="NPM request failed")
+    except httpx.RequestError as e:
+        logger.error(f"NPM unreachable: {e}")
+        raise HTTPException(status_code=503, detail=f"Cannot reach NPM at {config.npm_url}: {str(e)}")
 
 
 # ── Input validation helpers ───────────────────────────────────────────────────
@@ -619,6 +676,7 @@ async def auth_status(request: Request):
         "missing_fields": config.missing_fields(),
         "authenticated":  bool(request.session.get("authenticated")),
         "login_required": _login_required(),
+        "csrf_token":     _csrf_token(request) if request.session.get("authenticated") else "",
     }
 
 
@@ -628,7 +686,7 @@ async def auth_login(request: Request, body: LoginBody):
     if not config.is_configured():
         raise HTTPException(status_code=400, detail="Application is not configured yet")
 
-    client_ip = request.client.host if request.client else "unknown"
+    client_ip = _client_ip(request)
     _record_login_attempt(client_ip)
 
     ok = False
@@ -678,6 +736,7 @@ async def auth_login(request: Request, body: LoginBody):
         raise HTTPException(status_code=401, detail="Invalid password")
 
     request.session["authenticated"] = True
+    _csrf_token(request)  # ensure token exists for subsequent unsafe requests
     return {"success": True}
 
 
@@ -694,8 +753,9 @@ async def auth_logout(request: Request):
 async def config_status():
     """Return whether the app is configured.
 
-    Called by the frontend on load to decide whether to show the wizard or the
-    main app.  Always accessible regardless of configuration state.
+    Note: the current SPA uses /api/auth/status for bootstrapping. This endpoint
+    is kept for compatibility / debugging. Once configured, it requires an
+    authenticated session (like other /api/* routes).
     """
     return {
         "configured":     config.is_configured(),
@@ -711,7 +771,8 @@ async def get_config():
     are replaced with a masked representation (first+last 4 chars visible).
     To change a sensitive field, clear it and enter the new value; the server
     detects unchanged masked values via _resolve() and keeps the existing credential.
-    Always accessible regardless of configuration state.
+    Accessible without auth only during first-run setup; once configured it
+    requires an authenticated session.
     """
     return {
         "configured":     config.is_configured(),
@@ -773,9 +834,21 @@ class ConfigProposal(BaseModel):
             raise ValueError("NPM URL must start with http:// or https://")
         return v
 
+class ConfigTestProposal(BaseModel):
+    cf_api_token:  str
+    cf_account_id: str
+    cf_zone_id:    str
+    npm_url:       str = ""
+    npm_email:     str
+    npm_password:  str
+    npm_cert_id:   int = 2
+    domain:        str = ""
+    short_domain:  str = ""
+    cf_list_name:  str = "shortlinks"
+
 
 @app.post("/api/config/test")
-async def test_config(proposal: ConfigProposal):
+async def test_config(proposal: ConfigTestProposal):
     """Test Cloudflare and NPM connectivity using the provided credentials.
 
     Performs a live check against both services without saving anything.

@@ -260,11 +260,17 @@ This console manages your Cloudflare DNS and API credentials. Keep it internal.
 
 **Access control**: Do not expose port 8099 to the public internet. The app requires a **console password** and a **signed session cookie** for all API calls after setup. Still treat network access as part of your trust boundary: combine the password with LAN-only or VPN-only reachability, firewall rules, and a strong session signing key.
 
-**Session signing**: On first successful wizard save, a random **`session_secret`** is written into `config.json` (unless **`SESSION_SECRET`** is already set in the environment, ≥16 characters). If console login is enabled but neither is present, the process **refuses to start** — set `SESSION_SECRET` or complete the wizard. For local experiments only, **`ALLOW_INSECURE_SESSION=1`** permits the built-in dev key (never use in production).
+**Session signing**: On first successful wizard save, a random **`session_secret`** is written into `config.json` (unless **`SESSION_SECRET`** is already set in the environment, ≥16 characters). If neither is present, the app uses a **per-process random** session key (secure, but sessions reset on restart). For stable sessions across restarts, set `SESSION_SECRET` in Compose or complete the wizard once and then restart so the middleware loads the persisted key.
 
 **HTTPS behind NPM**: When the browser only reaches the app over `https://`, set **`SESSION_COOKIE_HTTPS_ONLY=1`** in Compose so the session cookie is not sent on accidental `http://` hits.
 
+**Cookie settings**: By default the session cookie is **HttpOnly** (not accessible to JavaScript) and uses `SameSite=Lax`. You can set **`SESSION_COOKIE_SAMESITE=strict`** if you want stricter cross-site behavior.
+
+**CSRF protection**: All state-changing API requests require an `X-CSRF-Token` header (the SPA handles this automatically after login).
+
 **Login rate limiting**: `/api/auth/login` is limited per client IP (in-memory, resets on container restart) to slow password guessing.
+
+**Behind NPM**: If you proxy through NPM, enable **`TRUST_PROXY_HEADERS=1`** so rate limiting keys off the real client IP from `X-Forwarded-For` (only do this behind a trusted reverse proxy).
 
 **Backups**: Back up the Docker volume (or host bind mount) that holds **`/data/config.json`** — it contains Cloudflare/NPM credentials and your console password hash.
 

@@ -24,8 +24,17 @@ jobs:
       - name: Syntax check
         run: python -m py_compile main.py
 
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Ruff (format)
+        run: ruff format --check .
+
       - name: Run tests
         run: pytest -q
 
+      - name: Dependency audit (non-blocking)
+        run: pip-audit -r requirements.txt || true
+
       - name: Docker build smoke
-        run: docker build -t urlist-console:ci .
+        run: docker build -t penguinnest-console:ci .

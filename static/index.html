@@ -167,10 +167,13 @@
      files once and serve them from /static/vendor/ instead.
      See README for instructions. -->
 <script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"
+  integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"
   crossorigin="anonymous"></script>
 <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"
+  integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1"
   crossorigin="anonymous"></script>
 <script src="https://unpkg.com/@babel/standalone@7.26.10/babel.min.js"
+  integrity="sha384-BcI7nduYchENm39cFMEVJXHEE7fwHONANyn/pY2YTa+BNtrWF2bKBZeI0wqVithi"
   crossorigin="anonymous"></script>
 <script type="text/babel">
 const { useState, useEffect, useCallback } = React;
@@ -180,13 +183,19 @@ const { useState, useEffect, useCallback } = React;
 // Network errors (backend down) and HTTP errors are both surfaced as thrown
 // Error objects with actionable messages.
 
+let CSRF_TOKEN = '';
+
 const api = async (method, path, body) => {
   let r;
   try {
+    const headers = body ? { 'Content-Type': 'application/json' } : {};
+    if (!['GET','HEAD','OPTIONS'].includes(method) && CSRF_TOKEN) {
+      headers['X-CSRF-Token'] = CSRF_TOKEN;
+    }
     r = await fetch(path, {
       method,
       credentials: 'same-origin',
-      headers: body ? { 'Content-Type': 'application/json' } : {},
+      headers,
       body:    body ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
@@ -389,6 +398,12 @@ function LoginScreen({ onAuthed, toast }) {
     setBusy(true);
     try {
       await api('POST', '/api/auth/login', { password });
+      // Refresh CSRF token for subsequent unsafe requests
+      try {
+        const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
+        const s = await r.json();
+        CSRF_TOKEN = s.csrf_token || '';
+      } catch { /* ignore */ }
       onAuthed();
     } catch (e) {
       toast(e.message, 'err');
@@ -468,7 +483,13 @@ function WizardScreen({ onComplete, toast }) {
     try {
       await api('POST', '/api/config', form);
       await api('POST', '/api/auth/login', { password: form.console_password });
+      try {
+        const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
+        const s = await r.json();
+        CSRF_TOKEN = s.csrf_token || '';
+      } catch { /* ignore */ }
       toast('Configuration saved — welcome to PenguinNest Console!', 'ok');
+      toast('Tip: restart the container once to persist session signing across restarts.', 'ok');
       onComplete();
     } catch (e) {
       toast(e.message, 'err');
@@ -1081,6 +1102,7 @@ function App() {
     try {
       const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
       const s = await r.json();
+      CSRF_TOKEN = s.csrf_token || '';
       if (!s.configured) {
         setAppState('wizard');
         return;
@@ -1165,6 +1187,7 @@ function App() {
         </div>
         <button className="btn btn-ghost btn-sm" style={{ marginLeft: 8 }} onClick={async () => {
           try { await api('POST', '/api/auth/logout', null); } catch { /* ignore */ }
+          CSRF_TOKEN = '';
           setAppState('login');
         }} title="Sign out">Sign out</button>
         <button className="gear-btn" onClick={() => setShowSettings(true)} title="Settings">⚙</button>

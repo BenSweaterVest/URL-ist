@@ -1,0 +1,20 @@
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "I",  # pycodestyle/pyflakes/isort
+  "B",            # flake8-bugbear
+  "UP",           # pyupgrade
+]
+ignore = [
+  "E501", # line length handled by formatter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["main"]
+
+[tool.ruff.format]
+quote-style = "preserve"
+indent-style = "space"

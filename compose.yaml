@@ -10,7 +10,7 @@
 #
 # After the wizard completes:
 #   1. Use the Services tab to register the console itself:
-#        Subdomain:    url
+#        Subdomain:    console
 #        Backend host: <your-server-ip>
 #        Backend port: 8099
 #      This creates the DNS record AND the NPM proxy host in one step.
@@ -50,7 +50,8 @@ services:
     # environment:
     #   SESSION_SECRET: ""         # recommended — see README
     #   SESSION_COOKIE_HTTPS_ONLY: "1"   # when users only reach the UI over https://
-    #   ALLOW_INSECURE_SESSION: "1"     # dev only — weak session signing if no secret
+    #   SESSION_COOKIE_SAMESITE: "lax"  # lax|strict|none
+    #   TRUST_PROXY_HEADERS: "1"        # if behind NPM, trust X-Forwarded-For for rate limiting
     #   CF_API_TOKEN:  ""          # required
     #   CF_ACCOUNT_ID: ""          # required
     #   CF_ZONE_ID:    ""          # required

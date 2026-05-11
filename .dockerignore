@@ -4,3 +4,8 @@
 .terraform
 .tofu
 *.md
+tests/
+.github/
+scripts/
+requirements-dev.txt
+.python-version
