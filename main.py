@@ -686,14 +686,6 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="URLer", lifespan=lifespan)
-app.add_middleware(
-    SessionMiddleware,
-    secret_key=_session_secret(),
-    max_age=14 * 24 * 3600,
-    same_site=_session_cookie_same_site(),
-    https_only=_session_cookie_https_only(),
-)
-
 
 # ── Middleware ────────────────────────────────────────────────────────────────
 
@@ -756,6 +748,17 @@ async def add_request_id(request: Request, call_next):
         return response
     finally:
         _request_id_ctx.reset(token)
+
+
+# Session must wrap HTTP middleware that uses request.session (Starlette stacks
+# add_middleware in reverse: last registered = outermost = runs first on request).
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=_session_secret(),
+    max_age=14 * 24 * 3600,
+    same_site=_session_cookie_same_site(),
+    https_only=_session_cookie_https_only(),
+)
 
 
 # ── API helpers ───────────────────────────────────────────────────────────────
