@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 from starlette.testclient import TestClient
 
-_cfg_dir = Path(tempfile.mkdtemp(prefix="penguinnest_console_test_"))
+# Pytest often prepends `tests/` to sys.path; `main.py` lives at repo root.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+_cfg_dir = Path(tempfile.mkdtemp(prefix="urler_test_"))
 _cfg_path = _cfg_dir / "config.json"
 _cfg_path.write_text("{}", encoding="utf-8")
 os.environ["CONFIG_FILE"] = str(_cfg_path)
