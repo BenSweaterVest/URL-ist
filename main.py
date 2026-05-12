@@ -1241,9 +1241,12 @@ async def update_link(item_id: str, payload: LinkUpdate):
 
     source_url = str((existing.get("redirect") or {}).get("source_url", ""))
     old_target = str((existing.get("redirect") or {}).get("target_url", ""))
-    slug = source_url.replace(f"https://{config.short_domain}/", "", 1).strip("/")
+    # Slug comes from the stored source URL path — do not depend on current
+    # config.short_domain (it may have changed since the item was created).
+    path = (urlparse(source_url).path or "").strip("/")
+    slug = path.split("/")[-1] if path else ""
     if not slug:
-        raise HTTPException(status_code=400, detail="Could not resolve slug for this item")
+        raise HTTPException(status_code=400, detail="Could not resolve slug from source_url")
 
     # Step 1: remove old mapping
     await cf_request(
@@ -1275,7 +1278,7 @@ async def update_link(item_id: str, payload: LinkUpdate):
                 f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
                 json=[{
                     "redirect": {
-                        "source_url": f"https://{config.short_domain}/{slug}",
+                        "source_url": source_url,
                         "target_url": old_target,
                         "status_code": 301,
                     },
@@ -1677,6 +1680,14 @@ async def batch_services(payload: ServiceBatchRequest):
             })
             if not payload.continue_on_error:
                 break
+        except Exception as e:
+            failed.append({
+                "domain": f"{item.subdomain}.{config.domain}",
+                "error": str(e),
+                "status_code": 500,
+            })
+            if not payload.continue_on_error:
+                break
 
     return {
         "success": len(failed) == 0,
@@ -1691,6 +1702,7 @@ async def delete_service(payload: ServiceDelete):
     """Delete service in one action: NPM proxy host + matching Cloudflare DNS A record."""
     npm_deleted = False
     dns_deleted = False
+    dns_error: str | None = None
     dns_target_id = payload.dns_record_id
 
     # Step 1: delete proxy host
@@ -1712,8 +1724,15 @@ async def delete_service(payload: ServiceDelete):
                 break
 
     if dns_target_id:
-        await cf_request("DELETE", f"/zones/{config.cf_zone_id}/dns_records/{dns_target_id}")
-        dns_deleted = True
+        try:
+            await cf_request("DELETE", f"/zones/{config.cf_zone_id}/dns_records/{dns_target_id}")
+            dns_deleted = True
+        except HTTPException as e:
+            dns_error = str(e.detail)
+            logger.warning(
+                f"DNS delete failed after NPM delete: domain={payload.domain}, "
+                f"dns_record_id={dns_target_id}, detail={dns_error}"
+            )
 
     logger.info(
         f"Deleted service: domain={payload.domain}, proxy_host_id={payload.proxy_host_id}, "
@@ -1723,7 +1742,21 @@ async def delete_service(payload: ServiceDelete):
         "success": True,
         "proxy_deleted": npm_deleted,
         "dns_deleted": dns_deleted,
+        "dns_error": dns_error,
     }
+
+
+# Keys returned by NPM GET proxy-host that must not be sent back on PUT (version-sensitive).
+_NPM_PROXY_HOST_READONLY_KEYS: frozenset[str] = frozenset({
+    "id",
+    "created_on",
+    "modified_on",
+    "owner",
+    "owner_user",
+    "ssl_updated_on",
+    "deleted",
+    "is_deleted",
+})
 
 
 @app.post("/api/services/{proxy_host_id}/enabled", status_code=200)
@@ -1732,17 +1765,20 @@ async def set_service_enabled(proxy_host_id: int, payload: ServiceEnabledUpdate)
     if proxy_host_id <= 0:
         raise HTTPException(status_code=400, detail="Invalid proxy_host_id")
 
-    hosts = await npm_request("GET", "/api/nginx/proxy-hosts")
-    host = next((h for h in hosts if int(h.get("id", -1)) == proxy_host_id), None)
-    if not host:
+    raw = await npm_request("GET", f"/api/nginx/proxy-hosts/{proxy_host_id}")
+    if isinstance(raw, list):
+        host = raw[0] if raw else None
+    elif isinstance(raw, dict):
+        host = raw
+    else:
+        host = None
+    if not host or not isinstance(host, dict):
         raise HTTPException(status_code=404, detail="Proxy host not found")
 
-    update_body = dict(host)
+    update_body: dict[str, Any] = {
+        k: v for k, v in host.items() if k not in _NPM_PROXY_HOST_READONLY_KEYS
+    }
     update_body["enabled"] = payload.enabled
-
-    # Remove fields that can cause update rejections on some NPM versions.
-    for field in ("created_on", "modified_on", "owner", "owner_user"):
-        update_body.pop(field, None)
 
     result = await npm_request("PUT", f"/api/nginx/proxy-hosts/{proxy_host_id}", json=update_body)
     logger.info(f"Set proxy host {proxy_host_id} enabled={payload.enabled}")

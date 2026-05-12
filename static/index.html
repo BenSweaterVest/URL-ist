@@ -95,6 +95,7 @@
   .toast { padding: 10px 16px; border-radius: var(--radius); font-size: 12px; font-family: var(--mono); border: 1px solid; max-width: 380px; animation: toast-in 0.2s ease; }
   .toast.ok  { background: rgba(52,211,153,0.1); border-color: var(--ok);  color: var(--ok);  }
   .toast.err { background: rgba(248,113,113,0.1); border-color: var(--err); color: var(--err); }
+  .toast.warn { background: rgba(251,191,36,0.12); border-color: var(--warn); color: var(--warn); }
   @keyframes toast-in { from { opacity:0; transform: translateY(8px); } to { opacity:1; transform:translateY(0); } }
 
   /* ── Modals ── */
@@ -900,13 +901,15 @@ function DNSPanel({ toast, onMutate }) {
   };
 
   const del = async (id, n) => {
+    let typedDelete = false;
     if (isShortRecord(n)) {
       const second = prompt(
         `This is your short-links domain record (${n}). Deleting it will break short links until restored.\n\nType DELETE to confirm.`,
       );
       if (second !== 'DELETE') return;
+      typedDelete = true;
     }
-    if (!confirm(`Delete DNS record for ${n}?`)) return;
+    if (!typedDelete && !confirm(`Delete DNS record for ${n}?`)) return;
     try {
       await api('DELETE', `/api/dns/${id}`);
       toast(`${n} deleted`, 'ok');
@@ -1013,7 +1016,7 @@ function ServicesPanel({ toast, onMutate }) {
   const [fixingDns, setFixingDns] = useState(null);
   const [actingHost, setActingHost] = useState(null);
   const [batchText, setBatchText] = useState(`[
-  {"subdomain":"app1","forward_host":"10.0.0.209","forward_port":8080,"forward_scheme":"http","websocket":false,"ssl_verify_off":false}
+  {"subdomain":"app1","forward_host":"192.168.1.100","forward_port":8080,"forward_scheme":"http","websocket":false,"ssl_verify_off":false}
 ]`);
   const [batchPlan, setBatchPlan] = useState(null);
   const [batchContinue, setBatchContinue] = useState(false);
@@ -1074,12 +1077,19 @@ function ServicesPanel({ toast, onMutate }) {
 
     setActingHost(host.id);
     try {
-      await api('POST', '/api/services/delete', {
+      const res = await api('POST', '/api/services/delete', {
         proxy_host_id: host.id,
         domain,
         dns_record_id: serviceEntry.dns_record?.id || null,
       });
-      toast(`${domain} deleted`, 'ok');
+      if (res.dns_error) {
+        toast(
+          `${domain} removed from NPM, but DNS delete failed: ${res.dns_error}. Remove the A record manually if it still exists.`,
+          'warn',
+        );
+      } else {
+        toast(`${domain} deleted`, 'ok');
+      }
       load(); onMutate();
     } catch (e) { toast(e.message, 'err'); }
     finally { setActingHost(null); }
