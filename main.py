@@ -278,6 +278,15 @@ _login_attempts: dict[str, list[float]] = {}
 # config.json (first successful login persists the hash and clears this path).
 _console_password_env: str | None = None
 
+# scrypt parameters for console password hashing.
+# n=2**15 exceeds OpenSSL's default scrypt memory cap on some hosts (e.g. GitHub Actions),
+# so new hashes use a smaller N. Legacy hashes (no "v2" marker) still verify with n=2**15.
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_SCRYPT_DKLEN = 32
+_SCRYPT_N_LEGACY = 2**15
+_SCRYPT_N_DEFAULT = 2**13  # ~8 MiB peak — fits typical OpenSSL limits
+
 
 def _hash_console_password(password: str) -> str:
     """Return a salted scrypt string for storage in config.json (never store plaintext)."""
@@ -285,12 +294,12 @@ def _hash_console_password(password: str) -> str:
     key = hashlib.scrypt(
         password.encode(),
         salt=salt,
-        n=2**15,
-        r=8,
-        p=1,
-        dklen=32,
+        n=_SCRYPT_N_DEFAULT,
+        r=_SCRYPT_R,
+        p=_SCRYPT_P,
+        dklen=_SCRYPT_DKLEN,
     )
-    return f"scrypt:{salt.hex()}:{key.hex()}"
+    return f"scrypt:v2:{salt.hex()}:{key.hex()}"
 
 
 def _verify_console_password(password: str, stored: str) -> bool:
@@ -298,16 +307,24 @@ def _verify_console_password(password: str, stored: str) -> bool:
     if not stored.startswith("scrypt:"):
         return False
     try:
-        _, salt_hex, key_hex = stored.split(":", 2)
-        salt = bytes.fromhex(salt_hex)
-        expected = bytes.fromhex(key_hex)
+        parts = stored.split(":")
+        if len(parts) == 4 and parts[1] == "v2":
+            salt = bytes.fromhex(parts[2])
+            expected = bytes.fromhex(parts[3])
+            n_cost = _SCRYPT_N_DEFAULT
+        elif len(parts) == 3:
+            salt = bytes.fromhex(parts[1])
+            expected = bytes.fromhex(parts[2])
+            n_cost = _SCRYPT_N_LEGACY
+        else:
+            return False
         key = hashlib.scrypt(
             password.encode(),
             salt=salt,
-            n=2**15,
-            r=8,
-            p=1,
-            dklen=32,
+            n=n_cost,
+            r=_SCRYPT_R,
+            p=_SCRYPT_P,
+            dklen=_SCRYPT_DKLEN,
         )
         return secrets.compare_digest(key, expected)
     except (ValueError, OSError):
