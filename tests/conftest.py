@@ -13,6 +13,9 @@ _cfg_dir = Path(tempfile.mkdtemp(prefix="penguinnest_console_test_"))
 _cfg_path = _cfg_dir / "config.json"
 _cfg_path.write_text("{}", encoding="utf-8")
 os.environ["CONFIG_FILE"] = str(_cfg_path)
+# Avoid background reconcile hitting real APIs during pytest.
+os.environ.setdefault("RECONCILE_INTERVAL_SEC", "999999")
+os.environ.setdefault("RECONCILE_INITIAL_DELAY_SEC", "999999")
 
 import main as main_module  # noqa: E402
 
@@ -27,6 +30,14 @@ def reset_app_state(config_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Isolate each test: empty config, clear login rate-limit buckets."""
     monkeypatch.setattr(main_module, "CONFIG_FILE", config_path, raising=False)
     config_path.write_text("{}", encoding="utf-8")
+    for fname in ("activity.jsonl", "service-trash.json"):
+        p = config_path.parent / fname
+        if p.exists():
+            p.unlink()
+    main_module._metrics["http_requests_total"] = 0
+    main_module._metrics["reconcile_runs_total"] = 0
+    main_module._metrics["reconcile_last_unix"] = None
+    main_module.invalidate_integrations_health_cache()
     main_module._login_attempts.clear()
     main_module._load_config()
     yield

@@ -135,6 +135,18 @@
   .section-label { font-size: 10px; font-weight: 600; color: var(--text-3); letter-spacing: 0.1em; text-transform: uppercase; margin: 20px 0 10px; }
   .section-label.warn { color: var(--warn); }
 
+  .health-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .health-pill { font-size: 10px; font-family: var(--mono); padding: 3px 8px; border-radius: 10px; border: 1px solid var(--border2); color: var(--text-2); white-space: nowrap; }
+  .health-pill.ok { border-color: rgba(52,211,153,0.35); color: var(--ok); }
+  .health-pill.err { border-color: rgba(248,113,113,0.35); color: var(--err); }
+  .toolbar-search { width: 200px; padding: 6px 10px; font-size: 12px; }
+  input.input-invalid { border-color: var(--err) !important; }
+  .field-err { font-size: 11px; color: var(--err); margin-top: 4px; font-family: var(--mono); }
+  .activity-list { font-size: 12px; font-family: var(--mono); color: var(--text-2); line-height: 1.6; }
+  .activity-row { padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .activity-row:last-child { border-bottom: none; }
+  .activity-ts { color: var(--text-3); font-size: 10px; }
+
   /* ── Setup notice ── */
   .setup-notice { border: 1px dashed var(--border2); border-radius: var(--radius); padding: 24px; text-align: center; }
   .setup-notice h3 { color: var(--warn); font-size: 13px; margin-bottom: 8px; }
@@ -225,6 +237,23 @@ const api = async (method, path, body) => {
   }
   return r.json();
 };
+
+function validateSlug(s) {
+  const v = (s || '').trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9\-_]*$/.test(v);
+}
+function validateSubdomain(s) {
+  const v = (s || '').trim().toLowerCase();
+  return /^[a-z0-9][a-z0-9\-]*$/.test(v);
+}
+function validatePort(p) {
+  const n = Number(p);
+  return Number.isFinite(n) && Number.isInteger(n) && n >= 1 && n <= 65535;
+}
+function targetUrlOk(s) {
+  const v = (s || '').trim();
+  return v.startsWith('https://') || v.startsWith('http://');
+}
 
 
 // ── Toast notifications ───────────────────────────────────────────────────────
@@ -369,6 +398,7 @@ function ConfigForm({ form, setField, consolePasswordOptional, toast }) {
           <div className="field-hint">
             The certificate ID in NPM that covers *.yourdomain.com — find it in NPM → SSL Certificates → the cert ID shown in the URL when you click it
           </div>
+          {consolePasswordOptional && (
           <div style={{ marginTop: '10px', display: 'flex', gap: '8px' }}>
             <button className="btn btn-ghost btn-sm" type="button" onClick={async () => {
               try {
@@ -386,6 +416,7 @@ function ConfigForm({ form, setField, consolePasswordOptional, toast }) {
               Auto-detect wildcard cert
             </button>
           </div>
+          )}
         </div>
       </div>
 
@@ -634,6 +665,26 @@ function SettingsModal({ onClose, toast }) {
     }
   };
 
+  const exportBackup = async () => {
+    try {
+      const r = await fetch('/api/config/export', { credentials: 'same-origin' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.detail || r.statusText);
+      }
+      const blob = await r.blob();
+      const u = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = u;
+      a.download = 'urler-export.json';
+      a.click();
+      URL.revokeObjectURL(u);
+      toast('Backup downloaded (masked secrets)', 'ok');
+    } catch (e) {
+      toast(e.message, 'err');
+    }
+  };
+
   if (!form) return (
     <div className="overlay">
       <div className="modal" style={{textAlign:'center',padding:'40px',color:'var(--text-3)',fontFamily:'var(--mono)',fontSize:'12px'}}>
@@ -647,6 +698,7 @@ function SettingsModal({ onClose, toast }) {
       <ConfigForm form={form} setField={setField} consolePasswordOptional toast={toast} />
       <TestResults results={testResults} />
       <div className="modal-footer">
+        <button type="button" className="btn btn-ghost" onClick={exportBackup}>Export backup (JSON)</button>
         <button className="btn btn-ghost" onClick={test} disabled={testing}>
           {testing ? 'Testing…' : 'Test Connections'}
         </button>
@@ -672,6 +724,7 @@ function LinksPanel({ toast, onMutate }) {
   const [slug, setSlug]       = useState('');
   const [target, setTarget]   = useState('');
   const [saving, setSaving]   = useState(false);
+  const [linkFilter, setLinkFilter] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -690,6 +743,14 @@ function LinksPanel({ toast, onMutate }) {
 
   const addLink = async () => {
     if (!slug || !target) return;
+    if (!validateSlug(slug)) {
+      toast('Slug must start with a letter or number and contain only lowercase letters, numbers, hyphens, or underscores', 'err');
+      return;
+    }
+    if (!targetUrlOk(target)) {
+      toast('Destination must start with https:// or http://', 'err');
+      return;
+    }
     setSaving(true);
     try {
       await api('POST', '/api/links', { slug, target });
@@ -716,6 +777,10 @@ function LinksPanel({ toast, onMutate }) {
 
   const saveEdit = async () => {
     if (!editItem || !editTarget) return;
+    if (!targetUrlOk(editTarget)) {
+      toast('Destination must start with https:// or http://', 'err');
+      return;
+    }
     setSaving(true);
     try {
       await api('PUT', `/api/links/${editItem.id}`, { target: editTarget });
@@ -728,6 +793,14 @@ function LinksPanel({ toast, onMutate }) {
 
   const parseSlug = url => url?.replace(/^https?:\/\/[^/]+\//, '') || '';
   const items     = data?.items || [];
+  const q = (linkFilter || '').trim().toLowerCase();
+  const filtered = !q ? items : items.filter(item => {
+    const s = parseSlug(item.redirect?.source_url);
+    const t = (item.redirect?.target_url || '').toLowerCase();
+    return s.includes(q) || t.includes(q);
+  });
+  const slugOk = !slug || validateSlug(slug);
+  const targetOk = !target || targetUrlOk(target);
 
   return (
     <>
@@ -736,12 +809,18 @@ function LinksPanel({ toast, onMutate }) {
           <div className="panel-title">Short Links</div>
           <div className="panel-desc">short.yourdomain.com/{'{slug}'} → destination</div>
         </div>
-        <button className="btn btn-primary"
-          onClick={() => setShowAdd(true)}
-          disabled={data !== null && (!data.list_exists || (preflight && !preflight.ready))}
-          title={data !== null && !data.list_exists ? 'Run Tofu bootstrap first'
-            : (preflight && !preflight.ready ? 'Fix setup issues below first' : undefined)}
-        >+ New Link</button>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          {items.length > 0 && (
+            <input className="toolbar-search" type="search" placeholder="Filter…" value={linkFilter}
+              onChange={e => setLinkFilter(e.target.value)} aria-label="Filter links" />
+          )}
+          <button className="btn btn-primary"
+            onClick={() => setShowAdd(true)}
+            disabled={data !== null && (!data.list_exists || (preflight && !preflight.ready))}
+            title={data !== null && !data.list_exists ? 'Run Tofu bootstrap first'
+              : (preflight && !preflight.ready ? 'Fix setup issues below first' : undefined)}
+          >+ New Link</button>
+        </div>
       </div>
 
       {loading ? <div className="loading">loading</div>
@@ -775,12 +854,14 @@ function LinksPanel({ toast, onMutate }) {
           )}
           {items.length === 0 ? (
             <div className="empty">No short links yet. Add your first one.</div>
+          ) : filtered.length === 0 ? (
+            <div className="empty">No links match this filter.</div>
           ) : (
             <div className="table-wrap">
               <table>
                 <thead><tr><th>Slug</th><th>Destination</th><th></th></tr></thead>
                 <tbody>
-                  {items.map(item => {
+                  {filtered.map(item => {
                     const s = parseSlug(item.redirect?.source_url);
                     const t = item.redirect?.target_url;
                     return (
@@ -809,21 +890,23 @@ function LinksPanel({ toast, onMutate }) {
             <label>Slug</label>
             <div className="field-prefix">
               <span className="field-pre">short domain/</span>
-              <input type="text" placeholder="ha" value={slug} autoFocus
+              <input className={slug && !slugOk ? 'input-invalid' : ''} type="text" placeholder="ha" value={slug} autoFocus
                 onChange={e => setSlug(e.target.value.toLowerCase().replace(/[^a-z0-9\-_]/g, ''))} />
             </div>
+            {slug && !slugOk && <div className="field-err">Invalid slug format</div>}
             <div className="field-hint">Lowercase letters, numbers, hyphens, underscores</div>
           </div>
           <div className="field">
             <label>Destination URL</label>
-            <input type="text" placeholder="https://ha.yourdomain.com" value={target}
+            <input className={target && !targetOk ? 'input-invalid' : ''} type="text" placeholder="https://ha.yourdomain.com" value={target}
               onChange={e => setTarget(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && addLink()} />
+            {target && !targetOk && <div className="field-err">Must start with https:// or http://</div>}
             <div className="field-hint">Must start with https:// or http://</div>
           </div>
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={() => setShowAdd(false)}>Cancel</button>
-            <button className="btn btn-primary" onClick={addLink} disabled={saving || !slug || !target}>
+            <button className="btn btn-primary" onClick={addLink} disabled={saving || !slug || !target || !slugOk || !targetOk}>
               {saving ? 'Creating…' : 'Create Link'}
             </button>
           </div>
@@ -835,13 +918,15 @@ function LinksPanel({ toast, onMutate }) {
           <div className="field">
             <label>Destination URL</label>
             <input type="text" placeholder="https://example.com" value={editTarget}
+              className={editTarget && !targetUrlOk(editTarget) ? 'input-invalid' : ''}
               onChange={e => setEditTarget(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && saveEdit()} />
+            {editTarget && !targetUrlOk(editTarget) && <div className="field-err">Must start with https:// or http://</div>}
             <div className="field-hint">Must start with https:// or http://</div>
           </div>
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={() => setEditItem(null)}>Cancel</button>
-            <button className="btn btn-primary" onClick={saveEdit} disabled={saving || !editTarget}>
+            <button className="btn btn-primary" onClick={saveEdit} disabled={saving || !editTarget || !targetUrlOk(editTarget)}>
               {saving ? 'Saving…' : 'Save'}
             </button>
           </div>
@@ -863,6 +948,7 @@ function DNSPanel({ toast, onMutate }) {
   const [ip, setIp]           = useState('');
   const [proxied, setProxied] = useState(false);
   const [saving, setSaving]   = useState(false);
+  const [dnsFilter, setDnsFilter] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -917,6 +1003,12 @@ function DNSPanel({ toast, onMutate }) {
     } catch (e) { toast(e.message, 'err'); }
   };
 
+  const dq = (dnsFilter || '').trim().toLowerCase();
+  const recs = records || [];
+  const filteredDns = !dq ? recs : recs.filter(r =>
+    (r.name || '').toLowerCase().includes(dq) || (r.content || '').toLowerCase().includes(dq),
+  );
+
   return (
     <>
       <div className="panel-header">
@@ -924,18 +1016,24 @@ function DNSPanel({ toast, onMutate }) {
           <div className="panel-title">DNS Records</div>
           <div className="panel-desc">A records for your zone</div>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowAdd(true)}>+ New Record</button>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <input className="toolbar-search" type="search" placeholder="Filter…" value={dnsFilter}
+            onChange={e => setDnsFilter(e.target.value)} aria-label="Filter DNS records" />
+          <button className="btn btn-primary" onClick={() => setShowAdd(true)}>+ New Record</button>
+        </div>
       </div>
 
       {loading ? <div className="loading">loading</div>
       : records === null ? <div className="empty">Could not load DNS records — check the backend logs.</div>
       : records.length === 0 ? <div className="empty">No A records found.</div>
-      : (
+      : filteredDns.length === 0 ? (
+        <div className="empty">No records match this filter.</div>
+      ) : (
         <div className="table-wrap">
           <table>
             <thead><tr><th>Name</th><th>IP</th><th>Proxied</th><th></th></tr></thead>
             <tbody>
-              {records.map(r => (
+              {filteredDns.map(r => (
                 <tr key={r.id}>
                   <td>
                     <span className="mono">{r.name}</span>
@@ -1020,13 +1118,22 @@ function ServicesPanel({ toast, onMutate }) {
 ]`);
   const [batchPlan, setBatchPlan] = useState(null);
   const [batchContinue, setBatchContinue] = useState(false);
+  const [svcFilter, setSvcFilter] = useState('');
+  const [trashItems, setTrashItems] = useState([]);
+  const [restoringId, setRestoringId] = useState(null);
 
   const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
   const load = useCallback(async () => {
     setLoading(true);
-    try { setScan(await api('GET', '/api/scan')); }
-    catch (e) { toast(e.message, 'err'); }
+    try {
+      const [sc, tr] = await Promise.all([
+        api('GET', '/api/scan'),
+        api('GET', '/api/trash').catch(() => ({ items: [] })),
+      ]);
+      setScan(sc);
+      setTrashItems(tr.items || []);
+    } catch (e) { toast(e.message, 'err'); }
     finally { setLoading(false); }
   }, [toast]);
 
@@ -1034,6 +1141,14 @@ function ServicesPanel({ toast, onMutate }) {
 
   const add = async () => {
     if (!form.subdomain || !form.forward_host || !form.forward_port) return;
+    if (!validateSubdomain(form.subdomain)) {
+      toast('Subdomain must be lowercase letters, numbers, and hyphens only', 'err');
+      return;
+    }
+    if (!validatePort(form.forward_port)) {
+      toast('Port must be an integer from 1 to 65535', 'err');
+      return;
+    }
     setSaving(true);
     try {
       const res = await api('POST', '/api/services', { ...form, forward_port: Number(form.forward_port) });
@@ -1095,6 +1210,18 @@ function ServicesPanel({ toast, onMutate }) {
     finally { setActingHost(null); }
   };
 
+  const restoreTrash = async (entry) => {
+    if (!entry?.id) return;
+    if (!confirm(`Recreate service ${entry.domain} from snapshot?\n\nThis adds DNS + NPM again (same as a new service).`)) return;
+    setRestoringId(entry.id);
+    try {
+      await api('POST', `/api/trash/${entry.id}/restore`, {});
+      toast(`${entry.domain} restored`, 'ok');
+      load(); onMutate();
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setRestoringId(null); }
+  };
+
   const parseBatch = () => {
     try {
       const data = JSON.parse(batchText);
@@ -1134,6 +1261,19 @@ function ServicesPanel({ toast, onMutate }) {
   const services      = scan?.services        || [];
   const unmatchedDns  = scan?.unmatched_dns   || [];
   const passthroughDns = scan?.passthrough_dns || [];
+  const sq = (svcFilter || '').trim().toLowerCase();
+  const servicesF = !sq ? services : services.filter((serviceEntry) => {
+    const h = serviceEntry.proxy_host;
+    const domain = (h?.domain_names?.[0] || '').toLowerCase();
+    const back = `${h?.forward_scheme || ''}://${h?.forward_host || ''}:${h?.forward_port || ''}`.toLowerCase();
+    return domain.includes(sq) || back.includes(sq);
+  });
+  const unmatchedF = !sq ? unmatchedDns : unmatchedDns.filter(r =>
+    (r.name || '').toLowerCase().includes(sq) || (r.content || '').toLowerCase().includes(sq),
+  );
+  const passthroughF = !sq ? passthroughDns : passthroughDns.filter(r =>
+    (r.name || '').toLowerCase().includes(sq) || (r.content || '').toLowerCase().includes(sq),
+  );
 
   return (
     <>
@@ -1142,22 +1282,52 @@ function ServicesPanel({ toast, onMutate }) {
           <div className="panel-title">Services</div>
           <div className="panel-desc">NPM proxy hosts × Cloudflare DNS health</div>
         </div>
-        <div style={{ display: 'flex', gap: '8px' }}>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <input className="toolbar-search" type="search" placeholder="Filter services…" value={svcFilter}
+            onChange={e => setSvcFilter(e.target.value)} aria-label="Filter services" />
           <button className="btn btn-ghost" onClick={() => setShowBatch(true)}>Batch Import</button>
           <button className="btn btn-primary" onClick={() => setShowAdd(true)}>+ New Service</button>
         </div>
       </div>
 
+      {/* Recently deleted — restore snapshot */}
+      {trashItems.length > 0 && (
+        <div style={{ marginBottom: '20px' }}>
+          <div className="section-label">Recently deleted (restore)</div>
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>Domain</th><th>Deleted</th><th></th></tr></thead>
+              <tbody>
+                {trashItems.map((t) => (
+                  <tr key={t.id}>
+                    <td><span className="mono">{t.domain}</span></td>
+                    <td><span className="mono activity-ts">{t.ts || '—'}</span></td>
+                    <td className="td-actions">
+                      <button
+                        className="btn btn-ghost btn-sm"
+                        disabled={restoringId === t.id}
+                        onClick={() => restoreTrash(t)}
+                      >{restoringId === t.id ? '…' : 'Restore'}</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
       {/* Main services table */}
       {loading ? <div className="loading">loading</div>
       : scan === null ? <div className="empty">Could not load services — check the backend logs.</div>
       : services.length === 0 ? <div className="empty">No services configured yet. Use the button above to add the first one.</div>
+      : servicesF.length === 0 ? <div className="empty">No services match this filter.</div>
       : (
         <div className="table-wrap">
           <table>
             <thead><tr><th>Domain</th><th>Backend</th><th>DNS</th><th>SSL</th><th>WS</th><th>Status</th><th></th></tr></thead>
             <tbody>
-              {services.map((serviceEntry) => {
+              {servicesF.map((serviceEntry) => {
                 const { proxy_host: h, status } = serviceEntry;
                 const domain = h.domain_names?.[0];
                 return (
@@ -1214,7 +1384,9 @@ function ServicesPanel({ toast, onMutate }) {
             <table>
               <thead><tr><th>Name</th><th>IP</th><th>Note</th></tr></thead>
               <tbody>
-                {unmatchedDns.map(r => (
+                {unmatchedF.length === 0 ? (
+                  <tr><td colSpan="3" className="empty" style={{ border: 'none' }}>No rows match this filter.</td></tr>
+                ) : unmatchedF.map(r => (
                   <tr key={r.id}>
                     <td><span className="mono">{r.name}</span></td>
                     <td><span className="ip-cell">{r.content}</span></td>
@@ -1235,7 +1407,9 @@ function ServicesPanel({ toast, onMutate }) {
             <table>
               <thead><tr><th>Name</th><th>IP</th><th>Note</th></tr></thead>
               <tbody>
-                {passthroughDns.map(r => (
+                {passthroughF.length === 0 ? (
+                  <tr><td colSpan="3" className="empty" style={{ border: 'none' }}>No rows match this filter.</td></tr>
+                ) : passthroughF.map(r => (
                   <tr key={r.id}>
                     <td><span className="mono">{r.name}</span></td>
                     <td><span className="ip-cell">{r.content}</span></td>
@@ -1256,9 +1430,13 @@ function ServicesPanel({ toast, onMutate }) {
               <label>Subdomain</label>
               <div className="field-prefix">
                 <input type="text" placeholder="myservice" value={form.subdomain} autoFocus
+                  className={form.subdomain && !validateSubdomain(form.subdomain) ? 'input-invalid' : ''}
                   onChange={e => setField('subdomain', e.target.value.toLowerCase().replace(/[^a-z0-9\-]/g,'').replace(/^-+/,''))} />
                 <span className="field-suf">.yourdomain.com</span>
               </div>
+              {form.subdomain && !validateSubdomain(form.subdomain) && (
+                <div className="field-err">Use lowercase letters, numbers, and hyphens only</div>
+              )}
               <div className="field-hint">Subdomain only — base domain is appended automatically.</div>
             </div>
             <div className="field">
@@ -1276,8 +1454,12 @@ function ServicesPanel({ toast, onMutate }) {
             <div className="field span2">
               <label>Backend Port</label>
               <input type="number" placeholder="8080" value={form.forward_port}
+                className={form.forward_port !== '' && form.forward_port != null && !validatePort(form.forward_port) ? 'input-invalid' : ''}
                 onChange={e => setField('forward_port', e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && add()} />
+              {form.forward_port !== '' && form.forward_port != null && !validatePort(form.forward_port) && (
+                <div className="field-err">Port must be 1–65535</div>
+              )}
             </div>
             <div className="field span2">
               <label className="check-row label-plain">
@@ -1295,7 +1477,10 @@ function ServicesPanel({ toast, onMutate }) {
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={() => setShowAdd(false)}>Cancel</button>
             <button className="btn btn-primary" onClick={add}
-              disabled={saving || !form.subdomain || !form.forward_port}>
+              disabled={
+                saving || !form.subdomain || !form.forward_host || !form.forward_port
+                || !validateSubdomain(form.subdomain) || !validatePort(form.forward_port)
+              }>
               {saving ? 'Creating…' : 'Create Service'}
             </button>
           </div>
@@ -1371,6 +1556,77 @@ function ServicesPanel({ toast, onMutate }) {
             <button className="btn btn-primary" onClick={() => setCreated(null)}>Done</button>
           </div>
         </Modal>
+      )}
+    </>
+  );
+}
+
+
+// ── Integrations health (header) + Activity feed ─────────────────────────────
+
+function IntegrationsHealth() {
+  const [h, setH] = useState(null);
+  const tick = useCallback(async () => {
+    try {
+      setH(await api('GET', '/api/integrations/health'));
+    } catch {
+      setH(null);
+    }
+  }, []);
+  useEffect(() => {
+    tick();
+    const id = setInterval(tick, 45000);
+    return () => clearInterval(id);
+  }, [tick]);
+  if (!h) return null;
+  const cf = h.cloudflare || {};
+  const npm = h.npm || {};
+  return (
+    <div className="health-strip" title={`Last check: ${h.checked_at || ''}`}>
+      <span className={`health-pill ${cf.ok ? 'ok' : 'err'}`}>
+        CF {cf.ok ? 'ok' : 'fail'}{cf.latency_ms != null ? ` ${cf.latency_ms}ms` : ''}
+      </span>
+      <span className={`health-pill ${npm.ok ? 'ok' : 'err'}`}>
+        NPM {npm.ok ? 'ok' : 'fail'}{npm.latency_ms != null ? ` ${npm.latency_ms}ms` : ''}
+      </span>
+    </div>
+  );
+}
+
+function ActivityPanel({ toast }) {
+  const [events, setEvents] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await api('GET', '/api/activity?limit=150');
+      setEvents(r.events || []);
+    } catch (e) { toast(e.message, 'err'); }
+    finally { setLoading(false); }
+  }, [toast]);
+  useEffect(() => { load(); }, [load]);
+  return (
+    <>
+      <div className="panel-header">
+        <div>
+          <div className="panel-title">Activity</div>
+          <div className="panel-desc">Recent operations (JSONL on server)</div>
+        </div>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={load}>{loading ? '…' : 'Refresh'}</button>
+      </div>
+      {loading ? <div className="loading">loading</div>
+      : events.length === 0 ? <div className="empty">No events yet.</div>
+      : (
+        <div className="activity-list">
+          {events.map((ev, i) => (
+            <div className="activity-row" key={`${ev.ts}-${i}`}>
+              <div className="activity-ts">{ev.ts} <span style={{ opacity: 0.55 }}>{ev.request_id}</span></div>
+              <div><span style={{ color: 'var(--accent)' }}>{ev.action}</span>{' '}
+                {ev.detail && <span style={{ color: 'var(--text-3)' }}>{JSON.stringify(ev.detail)}</span>}
+              </div>
+            </div>
+          ))}
+        </div>
       )}
     </>
   );
@@ -1462,6 +1718,7 @@ function App() {
     { id: 'links',    label: 'Short Links', count: counts.links    },
     { id: 'dns',      label: 'DNS',         count: counts.dns      },
     { id: 'services', label: 'Services',    count: counts.services },
+    { id: 'activity', label: 'Activity',    count: null },
   ];
 
   return (
@@ -1470,12 +1727,13 @@ function App() {
         <span className="header-logo">🔗</span>
         <div>
           <div className="header-title">URLER</div>
-          <div className="header-sub">console</div>
+          <div className="header-sub">app console</div>
         </div>
         <div className="header-spacer" />
+        <IntegrationsHealth />
         <div className="header-status">
           <span className="status-dot" />
-          console
+          ready
         </div>
         <button className="btn btn-ghost btn-sm" style={{ marginLeft: 8 }} onClick={async () => {
           try { await api('POST', '/api/auth/logout', null); } catch { /* ignore */ }
@@ -1500,6 +1758,7 @@ function App() {
         {tab === 'links'    && <LinksPanel    toast={toast} onMutate={refreshCounts} />}
         {tab === 'dns'      && <DNSPanel      toast={toast} onMutate={refreshCounts} />}
         {tab === 'services' && <ServicesPanel toast={toast} onMutate={refreshCounts} />}
+        {tab === 'activity' && <ActivityPanel toast={toast} />}
       </main>
 
       {showSettings && (

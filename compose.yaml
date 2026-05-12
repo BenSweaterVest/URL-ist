@@ -9,8 +9,8 @@
 # credentials, test them, and save them to /data/config.json (persisted by the volume).
 #
 # After the wizard completes:
-#   1. Use the Services tab to register the console itself:
-#        Subdomain:    console
+#   1. Use the Services tab to register URLer itself:
+#        Subdomain:    urler
 #        Backend host: <your-server-ip>
 #        Backend port: 8099
 #      This creates the DNS record AND the NPM proxy host in one step.

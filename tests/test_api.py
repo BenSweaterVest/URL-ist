@@ -116,10 +116,14 @@ def test_login_rate_limit(client: TestClient) -> None:
     assert blocked.status_code == 429
 
 
-def test_csrf_enforced_on_unsafe_methods(configured_client: TestClient, csrf_headers: dict[str, str]) -> None:
+def test_csrf_enforced_on_unsafe_methods(
+    configured_client: TestClient, csrf_headers: dict[str, str]
+) -> None:
     """Unsafe method without CSRF should 403; with CSRF should pass auth layer."""
     # Without CSRF token -> blocked by middleware
-    r = configured_client.post("/api/dns", json={"name": "x", "content": "10.0.0.1", "proxied": False})
+    r = configured_client.post(
+        "/api/dns", json={"name": "x", "content": "10.0.0.1", "proxied": False}
+    )
     assert r.status_code == 403, r.text
 
     # With CSRF token -> passes CSRF; request may still fail because Cloudflare isn't mocked
@@ -131,7 +135,9 @@ def test_csrf_enforced_on_unsafe_methods(configured_client: TestClient, csrf_hea
     assert r2.status_code != 403, r2.text
 
 
-def test_preflight_authenticated_stub(monkeypatch: pytest.MonkeyPatch, configured_client: TestClient) -> None:
+def test_preflight_authenticated_stub(
+    monkeypatch: pytest.MonkeyPatch, configured_client: TestClient
+) -> None:
     async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
         if "/rules/lists" in path and method == "GET" and path.endswith("/rules/lists"):
             return {"result": [{"name": "shortlinks", "id": "abc123"}]}
