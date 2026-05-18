@@ -902,7 +902,7 @@ function LinksPanel({ toast, onMutate }) {
               onChange={e => setTarget(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && addLink()} />
             {target && !targetOk && <div className="field-err">Must start with https:// or http://</div>}
-            <div className="field-hint">Must start with https:// or http://</div>
+            <div className="field-hint">Must start with https:// or http://. New links use a 302 redirect so you can change the destination later without browsers caching the old target.</div>
           </div>
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={() => setShowAdd(false)}>Cancel</button>

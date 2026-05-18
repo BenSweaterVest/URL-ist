@@ -6,9 +6,15 @@ A self-hosted management console for [Cloudflare](https://cloudflare.com) + [Ngi
 
 | Panel | What it does |
 |-------|-------------|
-| **Short Links** | Create and manage `short.yourdomain.com/slug → destination` redirects via Cloudflare Bulk Redirects — runs at Cloudflare's edge, never touches your server |
+| **Short Links** | Create, edit, and delete `short.yourdomain.com/slug → destination` redirects via Cloudflare Bulk Redirects (302 by default so edits work after a browser has visited the slug) |
 | **DNS** | View, add, and delete Cloudflare A records for your zone |
-| **Services** | Add a new self-hosted service in one form: creates the DNS A record and the NPM proxy host together |
+| **Services** | Create services (DNS + NPM proxy host), delete them together, enable/disable proxy hosts, or batch-import from JSON with dry-run preview |
+
+### What each panel does
+
+- **Short Links** — Add slugs, change destinations in place, delete entries. Preflight checks list + DNS readiness. Requires one-time Tofu bootstrap.
+- **DNS** — Manage A records. Warns before deleting the short-links domain record.
+- **Services** — One form creates `subdomain.domain` DNS (→ NPM) and an NPM proxy host (→ your backend). Delete removes NPM host and DNS (with warnings on partial failure). Toggle enables/disables the NPM proxy without deleting DNS. **Batch Import** accepts a JSON array, preview, then apply. After creating a service, optional checklists link to Uptime Kuma and Homepage if you configured those URLs in Settings.
 
 **Architecture:**
 ```
@@ -125,6 +131,12 @@ Settings are saved to `/data/config.json` inside the container (persisted via Do
 | **Short Links Domain** | Full short link domain, e.g. `short.example.com` | For short links |
 | **CF List Name** | Cloudflare list name — must match `cf_list_name` in `terraform.tfvars` | For short links |
 | **NPM Cert ID** | ID of the wildcard SSL certificate in NPM (find in NPM → SSL Certificates) | For new services |
+| **Uptime Kuma URL** | Base URL of your Uptime Kuma instance (optional; used in post-create checklists) | Optional |
+| **Homepage URL** | Base URL of your Homepage dashboard (optional; used in post-create checklists) | Optional |
+
+**Editing `config.json` directly:** The app reads settings at startup and when you save via the UI. If you edit `/data/config.json` by hand, restart the container so middleware and in-memory config pick up changes (especially `session_secret`).
+
+**Config history:** Each save via Settings keeps a snapshot under `/data/config-versions/` (see Security section for retention).
 
 **URLer password:** Set in the wizard (stored as a salted hash in `config.json`). Used only to unlock this web UI — it is **not** tied to your Ubuntu `sudo` password (the app runs in Docker and cannot safely verify OS logins). You may reuse the same passphrase if you want, but it is stored separately.
 
@@ -147,19 +159,21 @@ Short links use [Cloudflare Bulk Redirects](https://developers.cloudflare.com/ru
 User visits short.example.com/ha
   → Cloudflare intercepts (edge node, near the user)
   → Looks up /ha in your redirect list
-  → Returns 301 to https://ha.example.com
+  → Returns 302 to https://ha.example.com (default; API also accepts 301/307/308)
   → User follows redirect directly to destination
 ```
 
+New links use **302** (temporary redirect) so you can change a slug’s destination later; **301** is cached aggressively by browsers and makes edits invisible to repeat visitors. Existing list items keep their original status code when you edit them.
+
 The authenticated API **`GET /api/links/preflight`** returns whether the redirect list exists, whether the short-domain **proxied A** record looks correct, and a short list of human-readable issues (the Short Links tab uses this).
 
-Your home server is never contacted for short link redirects. The console only needs to be running when you *manage* (add/delete) links — not for the redirects themselves.
+Your home server is never contacted for short link redirects. The console only needs to be running when you *manage* (add/edit/delete) links — not for the redirects themselves.
 
 > **Important:** Do not delete your configured short-links domain A record from the DNS tab. If removed, short links stop working until the record is recreated (typically by re-running `tofu apply`).
 
 **Availability**: Short links work even if your home server is offline.  
 **Latency**: Single-digit milliseconds from any location (Cloudflare edge node near the user, not your home upload speed).  
-**Cost**: Free tier covers personal use (no Workers, just native Cloudflare rules).
+**Cost**: Uses Cloudflare Bulk Redirects on the free plan (no Workers). Many free accounts are provisioned with **20 redirect list items** by default; if you hit a limit error after ~20 links, contact Cloudflare support to have your quota raised (often to 10,000). API errors from Cloudflare are shown in the UI with the message returned by Cloudflare.
 
 ### Services tab
 
@@ -168,7 +182,11 @@ Creates two things in sequence, with automatic DNS rollback if NPM fails:
 1. A Cloudflare A record: `subdomain.yourdomain.com → your-npm-ip`
 2. An NPM proxy host: `subdomain.yourdomain.com → scheme://backend-host:port` with your wildcard SSL cert
 
+**Delete** removes the NPM proxy host and matching DNS record (warns if one step fails). **Enable/disable** toggles the NPM proxy without removing DNS. **Batch import** accepts JSON (`[{ "subdomain", "forward_host", "forward_port", ... }]`), supports dry-run preview, and optional continue-on-error.
+
 If NPM proxy host creation fails, the DNS record is automatically rolled back. If you need to retry a partially-failed service creation, delete any orphaned DNS record from the DNS tab first.
+
+In **Settings**, use **Auto-detect wildcard cert** (after the app is configured) to fill NPM Cert ID from NPM. The first-run wizard does not call this endpoint until setup is complete.
 
 ### Tofu / console split
 
@@ -293,7 +311,7 @@ URLer manages your Cloudflare DNS and API credentials. Keep it internal.
 
 **Config history**: URLer keeps a rolling history of prior configs under **`/data/config-versions/`** (default: last 100). You can change retention with `CONFIG_HISTORY_LIMIT` (set to `0` to disable).
 
-**NPM proxying**: If you expose the console via NPM (`console.yourdomain.com`), ensure that DNS record is **not** publicly accessible — point it to your NPM's internal IP only, and do not open inbound firewall ports for it. Or use Tailscale for external access instead.
+**NPM proxying**: If you expose the console via NPM (`urler.yourdomain.com`), ensure that DNS record is **not** publicly accessible — point it to your NPM's internal IP only, and do not open inbound firewall ports for it. Or use Tailscale for external access instead.
 
 **Credentials at rest**: `config.json` is stored with `0o600` permissions (owner read/write only) inside the container. The volume should be on encrypted storage if your threat model requires it.
 

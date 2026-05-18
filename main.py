@@ -787,9 +787,8 @@ async def cf_request(method: str, path: str, **kwargs) -> Any:
         except Exception:
             msg = e.response.text
         logger.error(f"Cloudflare {method} {path} → {e.response.status_code}: {msg}")
-        # Return a safe, operator-friendly message to the SPA (log has detail).
         raise HTTPException(
-            status_code=e.response.status_code, detail="Cloudflare request failed"
+            status_code=e.response.status_code, detail=f"Cloudflare: {msg}"
         ) from None
     except httpx.RequestError as e:
         logger.error(f"Cloudflare unreachable: {e}")
@@ -878,7 +877,7 @@ async def npm_request(method: str, path: str, **kwargs) -> Any:
             msg = e.response.text
         logger.error(f"NPM {method} {path} → {e.response.status_code}: {msg}")
         raise HTTPException(
-            status_code=e.response.status_code, detail="NPM request failed"
+            status_code=e.response.status_code, detail=f"NPM: {msg}"
         ) from None
     except httpx.RequestError as e:
         logger.error(f"NPM unreachable: {e}")
@@ -1361,9 +1360,30 @@ async def short_links_preflight():
     }
 
 
+ALLOWED_REDIRECT_STATUS_CODES = frozenset({301, 302, 307, 308})
+DEFAULT_REDIRECT_STATUS_CODE = 302
+
+
+def _redirect_status_from_item(item: dict[str, Any]) -> int:
+    """Return a valid redirect status from a CF list item, defaulting to 302."""
+    try:
+        code = int((item.get("redirect") or {}).get("status_code", DEFAULT_REDIRECT_STATUS_CODE))
+    except (TypeError, ValueError):
+        return DEFAULT_REDIRECT_STATUS_CODE
+    return code if code in ALLOWED_REDIRECT_STATUS_CODES else DEFAULT_REDIRECT_STATUS_CODE
+
+
 class LinkCreate(BaseModel):
     slug: str
     target: str
+    status_code: int = DEFAULT_REDIRECT_STATUS_CODE
+
+    @field_validator("status_code")
+    @classmethod
+    def validate_status_code(cls, v: int) -> int:
+        if v not in ALLOWED_REDIRECT_STATUS_CODES:
+            raise ValueError("status_code must be 301, 302, 307, or 308")
+        return v
 
     @field_validator("slug")
     @classmethod
@@ -1398,7 +1418,10 @@ class LinkUpdate(BaseModel):
 
 @app.post("/api/links", status_code=201)
 async def create_link(link: LinkCreate):
-    """Add a redirect entry: SHORT_DOMAIN/{slug} → target (301).
+    """Add a redirect entry: SHORT_DOMAIN/{slug} → target (302 by default).
+
+    Uses 302 by default so browsers do not cache redirects permanently; edits to the
+    destination remain visible after a slug has been visited. Pass status_code for 301/307/308.
 
     The full source URL is constructed server-side; the frontend only deals in slugs.
     Requires short_domain to be configured (set in settings).
@@ -1416,7 +1439,13 @@ async def create_link(link: LinkCreate):
         "POST",
         f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
         json=[
-            {"redirect": {"source_url": source_url, "target_url": link.target, "status_code": 301}}
+            {
+                "redirect": {
+                    "source_url": source_url,
+                    "target_url": link.target,
+                    "status_code": link.status_code,
+                }
+            }
         ],
     )
     logger.info(f"Created short link: {source_url} → {link.target}")
@@ -1467,6 +1496,7 @@ async def update_link(item_id: str, payload: LinkUpdate):
 
     source_url = str((existing.get("redirect") or {}).get("source_url", ""))
     old_target = str((existing.get("redirect") or {}).get("target_url", ""))
+    status_code = _redirect_status_from_item(existing)
     # Slug comes from the stored source URL path — do not depend on current
     # config.short_domain (it may have changed since the item was created).
     path = (urlparse(source_url).path or "").strip("/")
@@ -1491,7 +1521,7 @@ async def update_link(item_id: str, payload: LinkUpdate):
                     "redirect": {
                         "source_url": f"https://{config.short_domain}/{slug}",
                         "target_url": payload.target,
-                        "status_code": 301,
+                        "status_code": status_code,
                     },
                 }
             ],
@@ -1510,7 +1540,7 @@ async def update_link(item_id: str, payload: LinkUpdate):
                         "redirect": {
                             "source_url": source_url,
                             "target_url": old_target,
-                            "status_code": 301,
+                            "status_code": status_code,
                         },
                     }
                 ],
@@ -2110,17 +2140,23 @@ async def delete_service(payload: ServiceDelete):
     }
 
 
-# Keys returned by NPM GET proxy-host that must not be sent back on PUT (version-sensitive).
-_NPM_PROXY_HOST_READONLY_KEYS: frozenset[str] = frozenset(
+# Fields NPM accepts on PUT — same set as create_service POST payload, plus enabled.
+_SAFE_NPM_PUT_KEYS: frozenset[str] = frozenset(
     {
-        "id",
-        "created_on",
-        "modified_on",
-        "owner",
-        "owner_user",
-        "ssl_updated_on",
-        "deleted",
-        "is_deleted",
+        "domain_names",
+        "forward_scheme",
+        "forward_host",
+        "forward_port",
+        "certificate_id",
+        "ssl_forced",
+        "http2_support",
+        "block_exploits",
+        "access_list_id",
+        "advanced_config",
+        "meta",
+        "locations",
+        "allow_websocket_upgrade",
+        "enabled",
     }
 )
 
@@ -2136,9 +2172,7 @@ async def set_service_enabled(proxy_host_id: int, payload: ServiceEnabledUpdate)
     if not host:
         raise HTTPException(status_code=404, detail="Proxy host not found")
 
-    update_body: dict[str, Any] = {
-        k: v for k, v in host.items() if k not in _NPM_PROXY_HOST_READONLY_KEYS
-    }
+    update_body: dict[str, Any] = {k: v for k, v in host.items() if k in _SAFE_NPM_PUT_KEYS}
     update_body["enabled"] = payload.enabled
 
     result = await npm_request("PUT", f"/api/nginx/proxy-hosts/{proxy_host_id}", json=update_body)

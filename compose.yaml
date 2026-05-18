@@ -80,4 +80,4 @@ volumes:
     #   driver_opts:
     #     type: none
     #     o: bind
-    #     device: /home/youruser/stacks/console/data
+    #     device: /home/youruser/stacks/urler/data
