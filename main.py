@@ -876,9 +876,7 @@ async def npm_request(method: str, path: str, **kwargs) -> Any:
         except Exception:
             msg = e.response.text
         logger.error(f"NPM {method} {path} → {e.response.status_code}: {msg}")
-        raise HTTPException(
-            status_code=e.response.status_code, detail=f"NPM: {msg}"
-        ) from None
+        raise HTTPException(status_code=e.response.status_code, detail=f"NPM: {msg}") from None
     except httpx.RequestError as e:
         logger.error(f"NPM unreachable: {e}")
         raise HTTPException(
