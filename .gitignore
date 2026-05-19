@@ -1,8 +1,27 @@
-# Local / secrets
+# ── Secrets & local config (never commit) ─────────────────────────────────────
 config.json
 **/config.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+terraform.tfvars
 *.tfvars
 !**/terraform.tfvars.example
+
+# Local agent / homelab notes (use AGENTS.example.md → AGENTS.local.md)
+AGENTS.md
+AGENTS.local.md
+*.local.md
+
+# Runtime data (Docker volume mirrors — do not commit)
+activity.jsonl
+service-trash.json
+config-versions/
+data/
+
+# OpenTofu / Terraform state
 .terraform/
 .tofu/
 *.tfstate
@@ -13,3 +32,16 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.egg-info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+AGENTS.md

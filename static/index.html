@@ -78,7 +78,12 @@
   td { padding: 11px 14px; border-top: 1px solid var(--border); font-size: 13px; vertical-align: middle; }
   tr:hover td { background: rgba(56,189,248,0.03); }
   .mono { font-family: var(--mono); font-size: 12px; }
-  .slug { color: var(--accent); font-family: var(--mono); font-size: 12px; }
+  .slug { color: var(--accent); font-family: var(--mono); font-size: 12px; font-weight: 500; }
+  .slug-link { color: var(--accent); font-family: var(--mono); font-size: 13px; font-weight: 500; text-decoration: none; }
+  .slug-link:hover { text-decoration: underline; }
+  .checklist-block { margin-bottom: 14px; padding: 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+  .checklist-block-title { font-size: 11px; font-weight: 600; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+  .snippet-pre { margin: 8px 0 0; padding: 10px; background: var(--surface2); border-radius: var(--radius); font-family: var(--mono); font-size: 11px; line-height: 1.5; white-space: pre-wrap; color: var(--text-2); }
   .url-cell { color: var(--text-2); font-family: var(--mono); font-size: 11px; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ip-cell { color: var(--text-2); font-family: var(--mono); font-size: 12px; }
   .td-actions { text-align: right; width: 60px; }
@@ -139,6 +144,10 @@
   .health-pill { font-size: 10px; font-family: var(--mono); padding: 3px 8px; border-radius: 10px; border: 1px solid var(--border2); color: var(--text-2); white-space: nowrap; }
   .health-pill.ok { border-color: rgba(52,211,153,0.35); color: var(--ok); }
   .health-pill.err { border-color: rgba(248,113,113,0.35); color: var(--err); }
+  .health-pill.muted { color: var(--text-3); }
+
+  .table-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; font-size: 12px; color: var(--text-3); font-family: var(--mono); }
+  .table-pager-actions { display: flex; gap: 8px; }
   .toolbar-search { width: 200px; padding: 6px 10px; font-size: 12px; }
   input.input-invalid { border-color: var(--err) !important; }
   .field-err { font-size: 11px; color: var(--err); margin-top: 4px; font-family: var(--mono); }
@@ -146,6 +155,22 @@
   .activity-row { padding: 8px 0; border-bottom: 1px solid var(--border); }
   .activity-row:last-child { border-bottom: none; }
   .activity-ts { color: var(--text-3); font-size: 10px; }
+  .activity-detail { font-size: 10px; color: var(--text-3); margin-top: 4px; word-break: break-all; }
+  .activity-toggle { background: none; border: none; color: var(--accent); font-size: 10px; cursor: pointer; padding: 0; margin-top: 4px; font-family: var(--mono); }
+
+  .modal-error { background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.35); color: var(--err); padding: 10px 12px; border-radius: var(--radius); font-size: 12px; font-family: var(--mono); line-height: 1.5; margin-bottom: 16px; white-space: pre-wrap; word-break: break-word; }
+  .confirm-body { font-size: 13px; color: var(--text-2); line-height: 1.55; margin-bottom: 16px; white-space: pre-wrap; }
+  .confirm-input { margin-top: 12px; }
+
+  .getting-started { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin: 0 24px 0; padding: 14px 16px; border: 1px solid var(--border2); border-radius: var(--radius); background: var(--surface2); flex-shrink: 0; max-width: 1100px; width: calc(100% - 48px); margin-left: auto; margin-right: auto; margin-top: 16px; }
+  .getting-started ol { margin: 8px 0 0 18px; padding: 0; font-size: 12px; color: var(--text-2); line-height: 1.7; }
+  .getting-started li.done { color: var(--text-3); text-decoration: line-through; }
+  .getting-started-title { font-size: 13px; font-weight: 600; color: var(--text); }
+  .quota-banner { margin-bottom: 16px; padding: 12px 14px; border-radius: var(--radius); border: 1px solid rgba(251,191,36,0.35); background: rgba(251,191,36,0.08); font-size: 12px; color: var(--warn); line-height: 1.5; }
+  .table-dim { opacity: 0.55; pointer-events: none; transition: opacity 0.15s; }
+  .td-actions-wide { width: auto; min-width: 220px; }
+  .link-url { color: var(--text); font-family: var(--mono); font-size: 11px; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+  .panel-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
   /* ── Setup notice ── */
   .setup-notice { border: 1px dashed var(--border2); border-radius: var(--radius); padding: 24px; text-align: center; }
@@ -255,6 +280,153 @@ function targetUrlOk(s) {
   return v.startsWith('https://') || v.startsWith('http://');
 }
 
+const DNS_PAGE_SIZE = 50;
+const REDIRECT_STATUS_OPTIONS = [302, 301, 307, 308];
+
+function redirectStatusHint(code) {
+  if (code === 301) {
+    return 'Permanent redirect — browsers cache aggressively; changing the destination later may not affect repeat visitors.';
+  }
+  if (code === 302) {
+    return 'Temporary redirect (recommended) — you can change the destination later without browsers sticking to the old target.';
+  }
+  if (code === 307 || code === 308) {
+    return 'Strict redirect — preserves the HTTP method; use only when you need that behavior.';
+  }
+  return '';
+}
+
+function shortLinkUrl(shortDomain, slug) {
+  const host = (shortDomain || '').trim().replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  const s = (slug || '').replace(/^\//, '');
+  if (!host || !s) return '';
+  return `https://${host}/${s}`;
+}
+
+function trimUrlBase(u) {
+  return (u || '').trim().replace(/\/+$/, '');
+}
+
+function integrationUrl(base, path) {
+  const b = trimUrlBase(base);
+  if (!b) return '';
+  return `${b}${path.startsWith('/') ? path : `/${path}`}`;
+}
+
+function homepageServicesYaml(domain) {
+  const label = (domain.split('.')[0] || 'app').replace(/[^a-zA-Z0-9_-]/g, '') || 'app';
+  const title = label.charAt(0).toUpperCase() + label.slice(1);
+  return `- ${title}:\n    href: https://${domain}\n    description: ""\n    icon: ""`;
+}
+
+function redirectStatusBadgeClass(code) {
+  if (code === 301) return 'badge badge-warn';
+  if (code === 302) return 'badge badge-green';
+  return 'badge badge-gray';
+}
+
+async function copyToClipboard(text, toast) {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    toast && toast('Copied to clipboard', 'ok');
+  } catch {
+    toast && toast('Copy failed — check browser permissions', 'err');
+  }
+}
+
+const SETUP_BANNER_KEY = 'urler_setup_banner_dismissed';
+const SERVICES_TOFU_BANNER_KEY = 'urler_services_tofu_banner_dismissed';
+
+function ServiceCreatedChecklist({ created, integrations, toast }) {
+  const domain = created.domain;
+  const href = `https://${domain}`;
+  const dockge = trimUrlBase(integrations?.dockge_url);
+  const kuma = trimUrlBase(integrations?.uptime_kuma_url);
+  const homepage = trimUrlBase(integrations?.homepage_url);
+  const wiki = trimUrlBase(integrations?.wiki_url);
+  const homepageYaml = homepageServicesYaml(domain);
+  const kumaAdd = kuma ? integrationUrl(kuma, '/add') : '';
+  const wikiNew = wiki ? `${wiki}/#New%20Tiddler` : '';
+
+  return (
+    <>
+      <div className="section-label">Next steps</div>
+      <p className="field-hint" style={{ marginBottom: '12px' }}>
+        DNS and NPM are ready. Finish the homelab workflow below (links open in a new tab).
+      </p>
+
+      {dockge && (
+        <div className="checklist-block">
+          <div className="checklist-block-title">1. Deploy stack (Dockge)</div>
+          <a href={dockge} target="_blank" rel="noreferrer" className="mono">Open Dockge</a>
+          <div className="field-hint" style={{ marginTop: '6px' }}>
+            Create or update the compose stack for <span className="mono">{domain}</span> pointing at your backend.
+          </div>
+        </div>
+      )}
+
+      <div className="checklist-block">
+        <div className="checklist-block-title">{dockge ? '2' : '1'}. Uptime Kuma monitor</div>
+        <span className="mono">{href}</span>
+        {kumaAdd ? (
+          <> — <a href={kumaAdd} target="_blank" rel="noreferrer">Add monitor</a></>
+        ) : kuma ? (
+          <> — <a href={kuma} target="_blank" rel="noreferrer">Open Uptime Kuma</a> (set URL in Settings for /add link)</>
+        ) : (
+          <div className="field-hint" style={{ marginTop: '6px' }}>Set Uptime Kuma URL in Settings for a direct add-monitor link.</div>
+        )}
+      </div>
+
+      <div className="checklist-block">
+        <div className="checklist-block-title">Homepage tile</div>
+        <pre className="snippet-pre">{homepageYaml}</pre>
+        <div style={{ marginTop: '8px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => copyToClipboard(homepageYaml, toast)}>
+            Copy YAML snippet
+          </button>
+          {homepage && (
+            <a className="btn btn-ghost btn-sm" href={homepage} target="_blank" rel="noreferrer">Open Homepage</a>
+          )}
+        </div>
+      </div>
+
+      {wikiNew && (
+        <div className="checklist-block">
+          <div className="checklist-block-title">TiddlyWiki</div>
+          <a href={wikiNew} target="_blank" rel="noreferrer">New tiddler</a>
+          <div className="field-hint" style={{ marginTop: '6px' }}>Document the service on your wiki.</div>
+        </div>
+      )}
+
+      <div className="checklist-block">
+        <div className="checklist-block-title">First-run app setup</div>
+        <div className="field-hint">Open the service URL, complete its wizard, and change default credentials.</div>
+      </div>
+    </>
+  );
+}
+
+function formatActivityEvent(ev) {
+  const d = ev.detail || {};
+  const map = {
+    'config.updated': () => `Settings saved${d.configured ? '' : ' (not fully configured)'}`,
+    'link.created': () => `Created short link /${d.slug || '?'}`,
+    'link.updated': () => `Updated short link /${d.slug || '?'}`,
+    'link.deleted': () => `Deleted short link item ${d.item_id || '?'}`,
+    'dns.created': () => `Created DNS A record ${d.name || '?'}`,
+    'dns.deleted': () => `Deleted DNS record ${d.record_id || '?'}`,
+    'service.created': () => `Created service ${d.domain || '?'}`,
+    'service.deleted': () => `Deleted service ${d.domain || '?'}`,
+    'service.proxy_enabled': () => `Set proxy host #${d.proxy_host_id} ${d.enabled ? 'enabled' : 'disabled'}`,
+    'service.batch_apply': () => `Batch import: ${d.created ?? 0} created, ${d.failed ?? 0} failed`,
+    'service.restored_from_trash': () => `Restored service ${d.domain || '?'} from trash`,
+    'reconcile.scan': () => `Reconcile scan: ${d.unmatched_dns ?? 0} unmatched DNS, ${d.missing_dns_services ?? 0} missing DNS`,
+  };
+  const fn = map[ev.action];
+  return fn ? fn() : (ev.action || 'event');
+}
+
 
 // ── Toast notifications ───────────────────────────────────────────────────────
 
@@ -273,6 +445,139 @@ function ToastList({ toasts }) {
   return (
     <div className="toast-wrap">
       {toasts.map(t => <div key={t.id} className={`toast ${t.type}`}>{t.msg}</div>)}
+    </div>
+  );
+}
+
+function ModalError({ error, onDismiss }) {
+  if (!error) return null;
+  return (
+    <div className="modal-error" role="alert">
+      {error}
+      {onDismiss && (
+        <div style={{ marginTop: '8px' }}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={onDismiss}>Dismiss</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PanelRefreshButton({ onClick, loading, refreshing }) {
+  return (
+    <button type="button" className="btn btn-ghost btn-sm" onClick={onClick}
+      disabled={loading || refreshing} title="Reload from Cloudflare / NPM">
+      {refreshing ? 'Refreshing…' : 'Refresh'}
+    </button>
+  );
+}
+
+function useConfirm() {
+  const [pending, setPending] = useState(null);
+  const confirm = useCallback((opts) => new Promise((resolve) => {
+    setPending({ ...opts, resolve });
+  }), []);
+  const dialog = pending ? (
+    <ConfirmDialog
+      title={pending.title}
+      message={pending.message}
+      confirmLabel={pending.confirmLabel || 'Confirm'}
+      danger={pending.danger}
+      requireText={pending.requireText}
+      onConfirm={() => { pending.resolve(true); setPending(null); }}
+      onCancel={() => { pending.resolve(false); setPending(null); }}
+    />
+  ) : null;
+  return { confirm, dialog };
+}
+
+function ConfirmDialog({ title, message, confirmLabel, danger, requireText, onConfirm, onCancel }) {
+  const [typed, setTyped] = useState('');
+  useEffect(() => {
+    const h = e => e.key === 'Escape' && onCancel();
+    document.addEventListener('keydown', h);
+    return () => document.removeEventListener('keydown', h);
+  }, [onCancel]);
+  const ok = !requireText || typed === requireText;
+  return (
+    <div className="overlay" style={{ zIndex: 110 }} onClick={e => e.target === e.currentTarget && onCancel()}>
+      <div className="modal" role="dialog" aria-labelledby="confirm-title">
+        <div className="modal-title" id="confirm-title">{title}</div>
+        <div className="confirm-body">{message}</div>
+        {requireText && (
+          <div className="field confirm-input">
+            <label>Type {requireText} to confirm</label>
+            <input type="text" value={typed} autoFocus
+              onChange={e => setTyped(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && ok && onConfirm()} />
+          </div>
+        )}
+        <div className="modal-footer">
+          <button type="button" className="btn btn-ghost" onClick={onCancel}>Cancel</button>
+          <button type="button" className={`btn ${danger ? 'btn-danger' : 'btn-primary'}`}
+            disabled={!ok} onClick={onConfirm}>{confirmLabel}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GettingStartedBanner({ listExists, sessionSecretSource }) {
+  const [dismissed, setDismissed] = useState(() => {
+    try { return localStorage.getItem(SETUP_BANNER_KEY) === '1'; } catch { return false; }
+  });
+  if (dismissed) return null;
+  const needsRestart = sessionSecretSource === 'runtime';
+  const dismiss = () => {
+    try { localStorage.setItem(SETUP_BANNER_KEY, '1'); } catch { /* ignore */ }
+    setDismissed(true);
+  };
+  return (
+    <div className="getting-started">
+      <div>
+        <div className="getting-started-title">Getting started</div>
+        {needsRestart && (
+          <div className="quota-banner" style={{ marginTop: '10px', marginBottom: 0 }}>
+            Session cookies are signed with a temporary key. Restart once so login persists across container restarts:
+            <span className="mono"> docker compose restart</span>
+          </div>
+        )}
+        <ol>
+          <li className="done">Complete the setup wizard and sign in</li>
+          <li className={!needsRestart ? 'done' : ''}>
+            Restart the container once after first save (<span className="mono">docker compose restart</span>) so sessions persist
+          </li>
+          <li className={listExists ? 'done' : ''}>Run Tofu once for short links (<span className="mono">cd tofu &amp;&amp; tofu apply</span>)</li>
+          <li>Optional: set Dockge, Uptime Kuma, Homepage, and Wiki URLs in Settings for the post-create homelab checklist</li>
+        </ol>
+      </div>
+      <button type="button" className="btn btn-ghost btn-sm" onClick={dismiss}>Dismiss</button>
+    </div>
+  );
+}
+
+
+function TofuManagedDnsBanner() {
+  const [dismissed, setDismissed] = useState(() => {
+    try { return localStorage.getItem(SERVICES_TOFU_BANNER_KEY) === '1'; } catch { return false; }
+  });
+  if (dismissed) return null;
+  const dismiss = () => {
+    try { localStorage.setItem(SERVICES_TOFU_BANNER_KEY, '1'); } catch { /* ignore */ }
+    setDismissed(true);
+  };
+  return (
+    <div className="getting-started" style={{ marginBottom: '20px' }}>
+      <div>
+        <div className="getting-started-title">DNS managed via Cloudflare API</div>
+        <div className="field-hint" style={{ marginTop: '8px', lineHeight: 1.6 }}>
+          Services created here are managed directly via the Cloudflare API and will not appear in your Tofu state.
+          Records originally created by Tofu (<span className="mono">dns.tf</span>) that you delete here leave Tofu
+          state stale — run <span className="mono">tofu state rm</span> to clean up if needed. Prefer the Services tab
+          to remove DNS and NPM together.
+        </div>
+      </div>
+      <button type="button" className="btn btn-ghost btn-sm" onClick={dismiss}>Dismiss</button>
     </div>
   );
 }
@@ -327,11 +632,11 @@ function ConfigForm({ form, setField, consolePasswordOptional, toast }) {
         <div className="wizard-section-title">Console access</div>
         <div className="field">
           <label>Console password</label>
-          <input type="password" placeholder={consolePasswordOptional ? 'Leave blank to keep current' : 'At least 8 characters'} value={form.console_password || ''}
+          <input type="password" placeholder={consolePasswordOptional ? 'Leave blank to keep current' : 'At least 12 characters'} value={form.console_password || ''}
             onChange={e => setField('console_password', e.target.value)} />
           <div className="field-hint">
             {consolePasswordOptional
-              ? 'Leave both fields blank to keep your current password. To change it, enter a new password (8+ characters) twice.'
+              ? 'Leave both fields blank to keep your current password. To change it, enter a new password (12+ characters) twice.'
               : 'Protects this app only. Use a strong password unique to the console — not your Ubuntu, NPM, or Cloudflare password.'}
           </div>
         </div>
@@ -450,16 +755,28 @@ function ConfigForm({ form, setField, consolePasswordOptional, toast }) {
         <div className="wizard-section-title">Integrations (optional)</div>
         <div className="grid2">
           <div className="field">
+            <label>Dockge URL</label>
+            <input type="text" placeholder="https://dockge.yourdomain.com" value={form.dockge_url || ''}
+              onChange={e => setField('dockge_url', e.target.value)} />
+            <div className="field-hint">Post-create checklist: deploy compose stack.</div>
+          </div>
+          <div className="field">
+            <label>TiddlyWiki URL</label>
+            <input type="text" placeholder="https://wiki.yourdomain.com" value={form.wiki_url || ''}
+              onChange={e => setField('wiki_url', e.target.value)} />
+            <div className="field-hint">Post-create checklist: link to new tiddler.</div>
+          </div>
+          <div className="field">
             <label>Uptime Kuma URL</label>
             <input type="text" placeholder="https://uptime.yourdomain.com" value={form.uptime_kuma_url || ''}
               onChange={e => setField('uptime_kuma_url', e.target.value)} />
-            <div className="field-hint">Used for post-create reminders only.</div>
+            <div className="field-hint">Post-create: add-monitor link (/add).</div>
           </div>
           <div className="field">
             <label>Homepage URL</label>
             <input type="text" placeholder="https://home.yourdomain.com" value={form.homepage_url || ''}
               onChange={e => setField('homepage_url', e.target.value)} />
-            <div className="field-hint">Used for post-create reminders only.</div>
+            <div className="field-hint">Post-create: copy-paste services.yaml snippet.</div>
           </div>
         </div>
       </div>
@@ -531,6 +848,7 @@ const WIZARD_DEFAULTS = {
   npm_cert_id: 2, domain: '',
   short_domain: '', cf_list_name: 'shortlinks',
   uptime_kuma_url: '', homepage_url: '',
+  dockge_url: '', wiki_url: '',
 };
 
 function WizardScreen({ onComplete, toast }) {
@@ -544,7 +862,7 @@ function WizardScreen({ onComplete, toast }) {
   const requiredFilled = form.cf_api_token && form.cf_account_id && form.cf_zone_id
                       && form.npm_email && form.npm_password
                       && form.domain && form.npm_url
-                      && form.console_password && form.console_password.length >= 8
+                      && form.console_password && form.console_password.length >= 12
                       && form.console_password === form.console_password_confirm;
 
   const test = async () => {
@@ -627,6 +945,8 @@ function SettingsModal({ onClose, toast }) {
   const [testResults, setTestResults] = useState(null);
   const [testing, setTesting]       = useState(false);
   const [saving, setSaving]         = useState(false);
+  const [saveError, setSaveError]   = useState('');
+  const [testError, setTestError]   = useState('');
 
   const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
@@ -642,24 +962,26 @@ function SettingsModal({ onClose, toast }) {
   const test = async () => {
     setTesting(true);
     setTestResults(null);
+    setTestError('');
     try {
       const r = await api('POST', '/api/config/test', configTestPayload(form));
       setTestResults(r);
     } catch (e) {
-      toast(e.message, 'err');
+      setTestError(e.message);
     } finally {
       setTesting(false);
     }
   };
 
   const save = async () => {
+    setSaveError('');
     setSaving(true);
     try {
       await api('POST', '/api/config', form);
       toast('Settings saved', 'ok');
       onClose();
     } catch (e) {
-      toast(e.message, 'err');
+      setSaveError(e.message);
     } finally {
       setSaving(false);
     }
@@ -695,6 +1017,8 @@ function SettingsModal({ onClose, toast }) {
 
   return (
     <Modal title="Settings" onClose={onClose} wide>
+      <ModalError error={saveError} onDismiss={() => setSaveError('')} />
+      <ModalError error={testError} onDismiss={() => setTestError('')} />
       <ConfigForm form={form} setField={setField} consolePasswordOptional toast={toast} />
       <TestResults results={testResults} />
       <div className="modal-footer">
@@ -715,19 +1039,25 @@ function SettingsModal({ onClose, toast }) {
 // ── Links Panel ───────────────────────────────────────────────────────────────
 
 function LinksPanel({ toast, onMutate }) {
+  const { confirm, dialog: confirmDialog } = useConfirm();
   const [data, setData]       = useState(null);
   const [preflight, setPreflight] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [editItem, setEditItem] = useState(null);
   const [editTarget, setEditTarget] = useState('');
   const [slug, setSlug]       = useState('');
   const [target, setTarget]   = useState('');
+  const [statusCode, setStatusCode] = useState(302);
   const [saving, setSaving]   = useState(false);
+  const [addError, setAddError] = useState('');
+  const [editError, setEditError] = useState('');
   const [linkFilter, setLinkFilter] = useState('');
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (soft) => {
+    if (soft) setRefreshing(true);
+    else setLoading(true);
     try {
       const [linksRes, preRes] = await Promise.all([
         api('GET', '/api/links'),
@@ -736,58 +1066,73 @@ function LinksPanel({ toast, onMutate }) {
       setData(linksRes);
       setPreflight(preRes);
     } catch (e) { toast(e.message, 'err'); }
-    finally { setLoading(false); }
+    finally { setLoading(false); setRefreshing(false); }
   }, [toast]);
 
   useEffect(() => { load(); }, [load]);
 
+  const shortDomain = preflight?.short_domain || '';
+  const shortHost = shortDomain.replace(/^https?:\/\//, '').split('/')[0] || 'short domain';
+
   const addLink = async () => {
     if (!slug || !target) return;
+    setAddError('');
     if (!validateSlug(slug)) {
-      toast('Slug must start with a letter or number and contain only lowercase letters, numbers, hyphens, or underscores', 'err');
+      setAddError('Slug must start with a letter or number and contain only lowercase letters, numbers, hyphens, or underscores');
       return;
     }
     if (!targetUrlOk(target)) {
-      toast('Destination must start with https:// or http://', 'err');
+      setAddError('Destination must start with https:// or http://');
       return;
     }
     setSaving(true);
     try {
-      await api('POST', '/api/links', { slug, target });
-      toast(`/${slug} created`, 'ok');
-      setShowAdd(false); setSlug(''); setTarget('');
-      load(); onMutate();
-    } catch (e) { toast(e.message, 'err'); }
+      await api('POST', '/api/links', { slug, target, status_code: statusCode });
+      toast(`/${slug} created (${statusCode})`, 'ok');
+      setShowAdd(false); setSlug(''); setTarget(''); setStatusCode(302); setAddError('');
+      load(true); onMutate();
+    } catch (e) { setAddError(e.message); }
     finally { setSaving(false); }
   };
 
-  const del = async (id, s) => {
-    if (!confirm(`Delete /${s}?`)) return;
+  const del = async (id, s, fullUrl) => {
+    const ok = await confirm({
+      title: 'Delete short link?',
+      message: `Remove ${fullUrl || '/' + s}?\n\nVisitors will no longer be redirected to this slug.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await api('DELETE', `/api/links/${id}`);
       toast(`/${s} deleted`, 'ok');
-      load(); onMutate();
+      load(true); onMutate();
     } catch (e) { toast(e.message, 'err'); }
   };
 
   const openEdit = (item, s) => {
+    setEditError('');
     setEditItem({ id: item.id, slug: s });
     setEditTarget(item.redirect?.target_url || '');
   };
 
   const saveEdit = async () => {
     if (!editItem || !editTarget) return;
+    setEditError('');
     if (!targetUrlOk(editTarget)) {
-      toast('Destination must start with https:// or http://', 'err');
+      setEditError('Destination must start with https:// or http://');
       return;
     }
     setSaving(true);
     try {
       await api('PUT', `/api/links/${editItem.id}`, { target: editTarget });
-      toast(`/${editItem.slug} updated`, 'ok');
+      toast(
+        `/${editItem.slug} updated. Browsers that visited this link before may cache the old redirect for a while.`,
+        'ok',
+      );
       setEditItem(null); setEditTarget('');
-      load(); onMutate();
-    } catch (e) { toast(e.message, 'err'); }
+      load(true); onMutate();
+    } catch (e) { setEditError(e.message); }
     finally { setSaving(false); }
   };
 
@@ -797,25 +1142,32 @@ function LinksPanel({ toast, onMutate }) {
   const filtered = !q ? items : items.filter(item => {
     const s = parseSlug(item.redirect?.source_url);
     const t = (item.redirect?.target_url || '').toLowerCase();
-    return s.includes(q) || t.includes(q);
+    const u = shortLinkUrl(shortDomain, s).toLowerCase();
+    return s.includes(q) || t.includes(q) || u.includes(q);
   });
   const slugOk = !slug || validateSlug(slug);
   const targetOk = !target || targetUrlOk(target);
+  const nearQuota = items.length >= 18;
+  const listTruncated = data?.truncated === true;
 
   return (
     <>
+      {confirmDialog}
       <div className="panel-header">
         <div>
           <div className="panel-title">Short Links</div>
-          <div className="panel-desc">short.yourdomain.com/{'{slug}'} → destination</div>
+          <div className="panel-desc">{shortDomain
+              ? <>Create, edit, and delete redirects on <span className="mono">{shortDomain}</span></>
+              : 'Create, edit, and delete edge redirects (set Short Links Domain in Settings)'}</div>
         </div>
-        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+        <div className="panel-actions">
+          <PanelRefreshButton onClick={() => load(true)} loading={loading} refreshing={refreshing} />
           {items.length > 0 && (
             <input className="toolbar-search" type="search" placeholder="Filter…" value={linkFilter}
               onChange={e => setLinkFilter(e.target.value)} aria-label="Filter links" />
           )}
           <button className="btn btn-primary"
-            onClick={() => setShowAdd(true)}
+            onClick={() => { setAddError(''); setStatusCode(302); setShowAdd(true); }}
             disabled={data !== null && (!data.list_exists || (preflight && !preflight.ready))}
             title={data !== null && !data.list_exists ? 'Run Tofu bootstrap first'
               : (preflight && !preflight.ready ? 'Fix setup issues below first' : undefined)}
@@ -852,26 +1204,52 @@ function LinksPanel({ toast, onMutate }) {
               )}
             </div>
           )}
+          {listTruncated && (
+            <div className="quota-banner">
+              Not all short links could be loaded (pagination limit). Some entries may be missing from this list.
+            </div>
+          )}
+          {nearQuota && (
+            <div className="quota-banner">
+              You have {items.length} short links. Many Cloudflare free accounts are limited to 20 list items;
+              if creation fails, contact Cloudflare support to raise your bulk redirect quota.
+            </div>
+          )}
           {items.length === 0 ? (
             <div className="empty">No short links yet. Add your first one.</div>
           ) : filtered.length === 0 ? (
             <div className="empty">No links match this filter.</div>
           ) : (
-            <div className="table-wrap">
+            <div className={`table-wrap ${refreshing ? 'table-dim' : ''}`}>
               <table>
-                <thead><tr><th>Slug</th><th>Destination</th><th></th></tr></thead>
+                <thead><tr><th>Slug</th><th>Destination</th><th>Code</th><th></th></tr></thead>
                 <tbody>
                   {filtered.map(item => {
                     const s = parseSlug(item.redirect?.source_url);
                     const t = item.redirect?.target_url;
+                    const full = shortLinkUrl(shortDomain, s) || item.redirect?.source_url;
+                    const code = item.redirect?.status_code ?? 302;
                     return (
                       <tr key={item.id}>
-                        <td><span className="slug">/{s}</span></td>
+                        <td>
+                          {full ? (
+                            <a className="slug-link" href={full} target="_blank" rel="noreferrer" title={full}>/{s}</a>
+                          ) : (
+                            <span className="slug">/{s}</span>
+                          )}
+                        </td>
                         <td><div className="url-cell" title={t}>{t}</div></td>
-                        <td className="td-actions">
+                        <td>
+                          <span className={redirectStatusBadgeClass(code)} title={redirectStatusHint(code) || undefined}>{code}</span>
+                        </td>
+                        <td className="td-actions td-actions-wide">
                           <span className="cell-action" style={{ justifyContent: 'flex-end' }}>
-                            <button className="btn btn-ghost btn-sm" onClick={() => openEdit(item, s)}>Edit</button>
-                            <button className="btn btn-danger btn-sm" onClick={() => del(item.id, s)}>✕</button>
+                            <button type="button" className="btn btn-ghost btn-sm" title="Copy short URL"
+                              onClick={() => copyToClipboard(full, toast)}>Copy</button>
+                            <button type="button" className="btn btn-ghost btn-sm" title="Open in new tab"
+                              onClick={() => full && window.open(full, '_blank', 'noopener,noreferrer')}>Open</button>
+                            <button type="button" className="btn btn-ghost btn-sm" onClick={() => openEdit(item, s)}>Edit</button>
+                            <button type="button" className="btn btn-danger btn-sm" onClick={() => del(item.id, s, full)}>Delete</button>
                           </span>
                         </td>
                       </tr>
@@ -885,11 +1263,12 @@ function LinksPanel({ toast, onMutate }) {
       )}
 
       {showAdd && (
-        <Modal title="New Short Link" onClose={() => setShowAdd(false)}>
+        <Modal title="New Short Link" onClose={() => { setShowAdd(false); setAddError(''); setStatusCode(302); }}>
+          <ModalError error={addError} onDismiss={() => setAddError('')} />
           <div className="field">
             <label>Slug</label>
             <div className="field-prefix">
-              <span className="field-pre">short domain/</span>
+              <span className="field-pre">{shortHost}/</span>
               <input className={slug && !slugOk ? 'input-invalid' : ''} type="text" placeholder="ha" value={slug} autoFocus
                 onChange={e => setSlug(e.target.value.toLowerCase().replace(/[^a-z0-9\-_]/g, ''))} />
             </div>
@@ -902,7 +1281,17 @@ function LinksPanel({ toast, onMutate }) {
               onChange={e => setTarget(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && addLink()} />
             {target && !targetOk && <div className="field-err">Must start with https:// or http://</div>}
-            <div className="field-hint">Must start with https:// or http://. New links use a 302 redirect so you can change the destination later without browsers caching the old target.</div>
+            <div className="field-hint">Must start with https:// or http://</div>
+          </div>
+          <div className="field">
+            <label>Redirect status</label>
+            <select value={statusCode} onChange={e => setStatusCode(Number(e.target.value))}
+              style={{ width: '100%', background: 'var(--bg)', border: '1px solid var(--border2)', color: 'var(--text)', borderRadius: 'var(--radius)', padding: '8px 10px', fontFamily: 'var(--mono)', fontSize: '12px' }}>
+              {REDIRECT_STATUS_OPTIONS.map(c => (
+                <option key={c} value={c}>{c}{c === 302 ? ' (recommended)' : ''}</option>
+              ))}
+            </select>
+            <div className="field-hint">{redirectStatusHint(statusCode)}</div>
           </div>
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={() => setShowAdd(false)}>Cancel</button>
@@ -914,7 +1303,11 @@ function LinksPanel({ toast, onMutate }) {
       )}
 
       {editItem && (
-        <Modal title={`Edit /${editItem.slug}`} onClose={() => setEditItem(null)}>
+        <Modal title={`Edit /${editItem.slug}`} onClose={() => { setEditItem(null); setEditError(''); }}>
+          <ModalError error={editError} onDismiss={() => setEditError('')} />
+          <div className="field-hint" style={{ marginBottom: '12px' }}>
+            Short URL: <span className="mono">{shortLinkUrl(shortDomain, editItem.slug)}</span>
+          </div>
           <div className="field">
             <label>Destination URL</label>
             <input type="text" placeholder="https://example.com" value={editTarget}
@@ -922,7 +1315,7 @@ function LinksPanel({ toast, onMutate }) {
               onChange={e => setEditTarget(e.target.value)}
               onKeyDown={e => e.key === 'Enter' && saveEdit()} />
             {editTarget && !targetUrlOk(editTarget) && <div className="field-err">Must start with https:// or http://</div>}
-            <div className="field-hint">Must start with https:// or http://</div>
+            <div className="field-hint">Must start with https:// or http://. Browsers may cache old redirects for repeat visitors.</div>
           </div>
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={() => setEditItem(null)}>Cancel</button>
@@ -939,45 +1332,72 @@ function LinksPanel({ toast, onMutate }) {
 
 // ── DNS Panel ─────────────────────────────────────────────────────────────────
 
+function TablePager({ page, pageSize, total, onPage }) {
+  if (total <= pageSize) return null;
+  const pages = Math.max(1, Math.ceil(total / pageSize));
+  const start = page * pageSize + 1;
+  const end = Math.min(total, (page + 1) * pageSize);
+  return (
+    <div className="table-pager">
+      <span>Showing {start}–{end} of {total}</span>
+      <div className="table-pager-actions">
+        <button type="button" className="btn btn-ghost btn-sm" disabled={page <= 0} onClick={() => onPage(page - 1)}>Previous</button>
+        <button type="button" className="btn btn-ghost btn-sm" disabled={page >= pages - 1} onClick={() => onPage(page + 1)}>Next</button>
+      </div>
+    </div>
+  );
+}
+
 function DNSPanel({ toast, onMutate }) {
+  const { confirm, dialog: confirmDialog } = useConfirm();
   const [records, setRecords] = useState(null);
+  const [dnsTruncated, setDnsTruncated] = useState(false);
   const [shortDomain, setShortDomain] = useState('');
+  const [baseDomain, setBaseDomain] = useState('');
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
+  const [addError, setAddError] = useState('');
   const [name, setName]       = useState('');
   const [ip, setIp]           = useState('');
   const [proxied, setProxied] = useState(false);
   const [saving, setSaving]   = useState(false);
   const [dnsFilter, setDnsFilter] = useState('');
+  const [dnsPage, setDnsPage] = useState(0);
+  const [npmProxyDomains, setNpmProxyDomains] = useState(() => new Set());
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (soft) => {
+    if (soft) setRefreshing(true);
+    else setLoading(true);
     try {
       const [dns, cfg] = await Promise.all([
         api('GET', '/api/dns'),
         api('GET', '/api/config'),
       ]);
-      setRecords(dns);
+      setRecords(dns.records || []);
+      setDnsTruncated(!!dns.truncated);
       setShortDomain((cfg.short_domain || '').toLowerCase());
+      setBaseDomain(cfg.domain || '');
+      setNpmProxyDomains(new Set((dns.npm_proxy_domains || []).map(x => (x || '').toLowerCase())));
     }
     catch (e) { toast(e.message, 'err'); }
-    finally { setLoading(false); }
+    finally { setLoading(false); setRefreshing(false); }
   }, [toast]);
 
   useEffect(() => { load(); }, [load]);
 
+  const domainSuffix = baseDomain ? `.${baseDomain}` : '.yourdomain.com';
+
   const add = async () => {
     if (!name) return;
+    setAddError('');
     setSaving(true);
     try {
-      // Send name as-is — Cloudflare accepts both bare subdomains ('myservice')
-      // and FQDNs ('myservice.example.com') and normalises both to the FQDN.
-      // Never append a hardcoded domain here; the backend uses config.domain.
       await api('POST', '/api/dns', { name, content: ip || undefined, proxied });
       toast(`${name} created`, 'ok');
-      setShowAdd(false); setName(''); setIp(''); setProxied(false);
-      load(); onMutate();
-    } catch (e) { toast(e.message, 'err'); }
+      setShowAdd(false); setName(''); setIp(''); setProxied(false); setAddError('');
+      load(true); onMutate();
+    } catch (e) { setAddError(e.message); }
     finally { setSaving(false); }
   };
 
@@ -987,19 +1407,37 @@ function DNSPanel({ toast, onMutate }) {
   };
 
   const del = async (id, n) => {
-    let typedDelete = false;
     if (isShortRecord(n)) {
-      const second = prompt(
-        `This is your short-links domain record (${n}). Deleting it will break short links until restored.\n\nType DELETE to confirm.`,
-      );
-      if (second !== 'DELETE') return;
-      typedDelete = true;
+      const ok = await confirm({
+        title: 'Delete short-links domain?',
+        message: `This is your short-links domain record (${n}). Deleting it will break short links until restored.`,
+        confirmLabel: 'Delete',
+        danger: true,
+        requireText: 'DELETE',
+      });
+      if (!ok) return;
+    } else if (npmProxyDomains.has((n || '').toLowerCase())) {
+      const ok = await confirm({
+        title: 'Active NPM proxy host',
+        message: `${n} has an active NPM proxy host. Use the Services tab to delete both together, or the service will be broken.`,
+        confirmLabel: 'Delete DNS only',
+        danger: true,
+        requireText: 'DELETE',
+      });
+      if (!ok) return;
+    } else {
+      const ok = await confirm({
+        title: 'Delete DNS record?',
+        message: `Remove the A record for ${n}?`,
+        confirmLabel: 'Delete',
+        danger: true,
+      });
+      if (!ok) return;
     }
-    if (!typedDelete && !confirm(`Delete DNS record for ${n}?`)) return;
     try {
       await api('DELETE', `/api/dns/${id}`);
       toast(`${n} deleted`, 'ok');
-      load(); onMutate();
+      load(true); onMutate();
     } catch (e) { toast(e.message, 'err'); }
   };
 
@@ -1008,20 +1446,35 @@ function DNSPanel({ toast, onMutate }) {
   const filteredDns = !dq ? recs : recs.filter(r =>
     (r.name || '').toLowerCase().includes(dq) || (r.content || '').toLowerCase().includes(dq),
   );
+  const dnsPageCount = Math.max(1, Math.ceil(filteredDns.length / DNS_PAGE_SIZE));
+  const safeDnsPage = Math.min(dnsPage, dnsPageCount - 1);
+  useEffect(() => { setDnsPage(0); }, [dq]);
+  useEffect(() => {
+    if (dnsPage !== safeDnsPage) setDnsPage(safeDnsPage);
+  }, [dnsPage, safeDnsPage]);
+  const pagedDns = filteredDns.slice(safeDnsPage * DNS_PAGE_SIZE, (safeDnsPage + 1) * DNS_PAGE_SIZE);
 
   return (
     <>
+      {confirmDialog}
       <div className="panel-header">
         <div>
           <div className="panel-title">DNS Records</div>
-          <div className="panel-desc">A records for your zone</div>
+          <div className="panel-desc">View, add, and delete A records for your zone</div>
         </div>
-        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+        <div className="panel-actions">
+          <PanelRefreshButton onClick={() => load(true)} loading={loading} refreshing={refreshing} />
           <input className="toolbar-search" type="search" placeholder="Filter…" value={dnsFilter}
             onChange={e => setDnsFilter(e.target.value)} aria-label="Filter DNS records" />
-          <button className="btn btn-primary" onClick={() => setShowAdd(true)}>+ New Record</button>
+          <button className="btn btn-primary" onClick={() => { setAddError(''); setShowAdd(true); }}>+ New Record</button>
         </div>
       </div>
+
+      {dnsTruncated && (
+        <div className="quota-banner">
+          Not all DNS records could be loaded (pagination limit). Some A records may be missing from this list.
+        </div>
+      )}
 
       {loading ? <div className="loading">loading</div>
       : records === null ? <div className="empty">Could not load DNS records — check the backend logs.</div>
@@ -1029,11 +1482,12 @@ function DNSPanel({ toast, onMutate }) {
       : filteredDns.length === 0 ? (
         <div className="empty">No records match this filter.</div>
       ) : (
-        <div className="table-wrap">
+        <>
+        <div className={`table-wrap ${refreshing ? 'table-dim' : ''}`}>
           <table>
             <thead><tr><th>Name</th><th>IP</th><th>Proxied</th><th></th></tr></thead>
             <tbody>
-              {filteredDns.map(r => (
+              {pagedDns.map(r => (
                 <tr key={r.id}>
                   <td>
                     <span className="mono">{r.name}</span>
@@ -1053,16 +1507,19 @@ function DNSPanel({ toast, onMutate }) {
             </tbody>
           </table>
         </div>
+        <TablePager page={safeDnsPage} pageSize={DNS_PAGE_SIZE} total={filteredDns.length} onPage={setDnsPage} />
+        </>
       )}
 
       {showAdd && (
-        <Modal title="New DNS A Record" onClose={() => setShowAdd(false)}>
+        <Modal title="New DNS A Record" onClose={() => { setShowAdd(false); setAddError(''); }}>
+          <ModalError error={addError} onDismiss={() => setAddError('')} />
           <div className="field">
             <label>Subdomain</label>
             <div className="field-prefix">
               <input type="text" placeholder="myservice" value={name} autoFocus
                 onChange={e => setName(e.target.value.toLowerCase().replace(/[^a-z0-9.\-]/g, ''))} />
-              <span className="field-suf">.yourdomain.com</span>
+              <span className="field-suf">{domainSuffix}</span>
             </div>
             <div className="field-hint">
               Bare subdomain or full FQDN — both accepted.<br/>
@@ -1104,9 +1561,13 @@ const EMPTY_FORM = {
 };
 
 function ServicesPanel({ toast, onMutate }) {
+  const { confirm, dialog: confirmDialog } = useConfirm();
   const [scan, setScan]           = useState(null);
+  const [baseDomain, setBaseDomain] = useState('');
   const [loading, setLoading]     = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [showAdd, setShowAdd]     = useState(false);
+  const [addError, setAddError]   = useState('');
   const [showBatch, setShowBatch] = useState(false);
   const [created, setCreated]     = useState(null);
   const [form, setForm]           = useState(EMPTY_FORM);
@@ -1117,6 +1578,7 @@ function ServicesPanel({ toast, onMutate }) {
   {"subdomain":"app1","forward_host":"192.168.1.100","forward_port":8080,"forward_scheme":"http","websocket":false,"ssl_verify_off":false}
 ]`);
   const [batchPlan, setBatchPlan] = useState(null);
+  const [batchError, setBatchError] = useState('');
   const [batchContinue, setBatchContinue] = useState(false);
   const [svcFilter, setSvcFilter] = useState('');
   const [trashItems, setTrashItems] = useState([]);
@@ -1124,29 +1586,33 @@ function ServicesPanel({ toast, onMutate }) {
 
   const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (soft) => {
+    if (soft) setRefreshing(true);
+    else setLoading(true);
     try {
-      const [sc, tr] = await Promise.all([
+      const [sc, tr, cfg] = await Promise.all([
         api('GET', '/api/scan'),
         api('GET', '/api/trash').catch(() => ({ items: [] })),
+        api('GET', '/api/config'),
       ]);
       setScan(sc);
       setTrashItems(tr.items || []);
+      setBaseDomain(cfg.domain || '');
     } catch (e) { toast(e.message, 'err'); }
-    finally { setLoading(false); }
+    finally { setLoading(false); setRefreshing(false); }
   }, [toast]);
 
   useEffect(() => { load(); }, [load]);
 
   const add = async () => {
     if (!form.subdomain || !form.forward_host || !form.forward_port) return;
+    setAddError('');
     if (!validateSubdomain(form.subdomain)) {
-      toast('Subdomain must be lowercase letters, numbers, and hyphens only', 'err');
+      setAddError('Subdomain must be lowercase letters, numbers, and hyphens only');
       return;
     }
     if (!validatePort(form.forward_port)) {
-      toast('Port must be an integer from 1 to 65535', 'err');
+      setAddError('Port must be an integer from 1 to 65535');
       return;
     }
     setSaving(true);
@@ -1154,9 +1620,9 @@ function ServicesPanel({ toast, onMutate }) {
       const res = await api('POST', '/api/services', { ...form, forward_port: Number(form.forward_port) });
       toast(`${res.domain} created`, 'ok');
       setCreated(res);
-      setShowAdd(false); setForm(EMPTY_FORM);
-      load(); onMutate();
-    } catch (e) { toast(e.message, 'err'); }
+      setShowAdd(false); setForm(EMPTY_FORM); setAddError('');
+      load(true); onMutate();
+    } catch (e) { setAddError(e.message); }
     finally { setSaving(false); }
   };
 
@@ -1168,7 +1634,7 @@ function ServicesPanel({ toast, onMutate }) {
     try {
       await api('POST', '/api/dns', { name: domain, content: npmHost, proxied: false });
       toast(`DNS added: ${domain} → ${npmHost}`, 'ok');
-      load(); onMutate();
+      load(true); onMutate();
     } catch (e) { toast(e.message, 'err'); }
     finally { setFixingDns(null); }
   };
@@ -1179,7 +1645,7 @@ function ServicesPanel({ toast, onMutate }) {
     try {
       await api('POST', `/api/services/${host.id}/enabled`, { enabled: !host.enabled });
       toast(`${domain} ${host.enabled ? 'disabled' : 'enabled'}`, 'ok');
-      load(); onMutate();
+      load(true); onMutate();
     } catch (e) { toast(e.message, 'err'); }
     finally { setActingHost(null); }
   };
@@ -1188,7 +1654,13 @@ function ServicesPanel({ toast, onMutate }) {
     const host = serviceEntry.proxy_host;
     const domain = host.domain_names?.[0];
     if (!domain) return;
-    if (!confirm(`Delete service ${domain}?\n\nThis removes both the NPM proxy host and the matching DNS record.`)) return;
+    const ok = await confirm({
+      title: 'Delete service?',
+      message: `Remove ${domain}?\n\nThis deletes the NPM proxy host and the matching Cloudflare DNS A record.`,
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
 
     setActingHost(host.id);
     try {
@@ -1205,19 +1677,24 @@ function ServicesPanel({ toast, onMutate }) {
       } else {
         toast(`${domain} deleted`, 'ok');
       }
-      load(); onMutate();
+      load(true); onMutate();
     } catch (e) { toast(e.message, 'err'); }
     finally { setActingHost(null); }
   };
 
   const restoreTrash = async (entry) => {
     if (!entry?.id) return;
-    if (!confirm(`Recreate service ${entry.domain} from snapshot?\n\nThis adds DNS + NPM again (same as a new service).`)) return;
+    const ok = await confirm({
+      title: 'Restore service?',
+      message: `Recreate ${entry.domain} from snapshot?\n\nThis adds DNS and an NPM proxy host again.`,
+      confirmLabel: 'Restore',
+    });
+    if (!ok) return;
     setRestoringId(entry.id);
     try {
       await api('POST', `/api/trash/${entry.id}/restore`, {});
       toast(`${entry.domain} restored`, 'ok');
-      load(); onMutate();
+      load(true); onMutate();
     } catch (e) { toast(e.message, 'err'); }
     finally { setRestoringId(null); }
   };
@@ -1233,34 +1710,43 @@ function ServicesPanel({ toast, onMutate }) {
   };
 
   const previewBatch = async () => {
+    setBatchError('');
     try {
       const items = parseBatch();
       const res = await api('POST', '/api/services/batch', { items, dry_run: true, continue_on_error: batchContinue });
       setBatchPlan(res.plan || []);
       toast(`Preview ready (${(res.plan || []).length} items)`, 'ok');
     } catch (e) {
-      toast(e.message, 'err');
+      setBatchError(e.message);
     }
   };
 
   const runBatch = async () => {
+    setBatchError('');
     try {
       const items = parseBatch();
       const res = await api('POST', '/api/services/batch', { items, dry_run: false, continue_on_error: batchContinue });
       const ok = (res.created || []).length;
       const bad = (res.failed || []).length;
-      toast(`Batch finished: ${ok} created, ${bad} failed`, bad ? 'err' : 'ok');
-      setShowBatch(false);
-      setBatchPlan(null);
-      load(); onMutate();
+      if (bad > 0) {
+        const lines = (res.failed || []).map(f => `${f.domain || '?'}: ${f.error || 'failed'}`);
+        setBatchError(`Created ${ok}, failed ${bad}:\n${lines.join('\n')}`);
+        setBatchPlan(res.plan || null);
+      } else {
+        toast(`Batch finished: ${ok} created`, 'ok');
+        setShowBatch(false);
+        setBatchPlan(null);
+        load(true); onMutate();
+      }
     } catch (e) {
-      toast(e.message, 'err');
+      setBatchError(e.message);
     }
   };
 
   const services      = scan?.services        || [];
   const unmatchedDns  = scan?.unmatched_dns   || [];
   const passthroughDns = scan?.passthrough_dns || [];
+  const scanDnsTruncated = scan?.dns_truncated === true;
   const sq = (svcFilter || '').trim().toLowerCase();
   const servicesF = !sq ? services : services.filter((serviceEntry) => {
     const h = serviceEntry.proxy_host;
@@ -1275,20 +1761,32 @@ function ServicesPanel({ toast, onMutate }) {
     (r.name || '').toLowerCase().includes(sq) || (r.content || '').toLowerCase().includes(sq),
   );
 
+  const domainSuffix = baseDomain ? `.${baseDomain}` : '.yourdomain.com';
+
   return (
     <>
+      {confirmDialog}
       <div className="panel-header">
         <div>
           <div className="panel-title">Services</div>
-          <div className="panel-desc">NPM proxy hosts × Cloudflare DNS health</div>
+          <div className="panel-desc">Create, enable/disable, delete, or batch-import services (DNS + NPM proxy host)</div>
         </div>
-        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+        <div className="panel-actions">
+          <PanelRefreshButton onClick={() => load(true)} loading={loading} refreshing={refreshing} />
           <input className="toolbar-search" type="search" placeholder="Filter services…" value={svcFilter}
             onChange={e => setSvcFilter(e.target.value)} aria-label="Filter services" />
           <button className="btn btn-ghost" onClick={() => setShowBatch(true)}>Batch Import</button>
-          <button className="btn btn-primary" onClick={() => setShowAdd(true)}>+ New Service</button>
+          <button className="btn btn-primary" onClick={() => { setAddError(''); setShowAdd(true); }}>+ New Service</button>
         </div>
       </div>
+
+      <TofuManagedDnsBanner />
+
+      {scanDnsTruncated && (
+        <div className="quota-banner">
+          DNS scan may be incomplete (pagination limit). Unmatched or passthrough DNS rows could be missing.
+        </div>
+      )}
 
       {/* Recently deleted — restore snapshot */}
       {trashItems.length > 0 && (
@@ -1323,7 +1821,7 @@ function ServicesPanel({ toast, onMutate }) {
       : services.length === 0 ? <div className="empty">No services configured yet. Use the button above to add the first one.</div>
       : servicesF.length === 0 ? <div className="empty">No services match this filter.</div>
       : (
-        <div className="table-wrap">
+        <div className={`table-wrap ${refreshing ? 'table-dim' : ''}`}>
           <table>
             <thead><tr><th>Domain</th><th>Backend</th><th>DNS</th><th>SSL</th><th>WS</th><th>Status</th><th></th></tr></thead>
             <tbody>
@@ -1424,7 +1922,8 @@ function ServicesPanel({ toast, onMutate }) {
 
       {/* New Service modal */}
       {showAdd && (
-        <Modal title="New Service" onClose={() => setShowAdd(false)}>
+        <Modal title="New Service" onClose={() => { setShowAdd(false); setAddError(''); }}>
+          <ModalError error={addError} onDismiss={() => setAddError('')} />
           <div className="grid2">
             <div className="field span2">
               <label>Subdomain</label>
@@ -1432,7 +1931,7 @@ function ServicesPanel({ toast, onMutate }) {
                 <input type="text" placeholder="myservice" value={form.subdomain} autoFocus
                   className={form.subdomain && !validateSubdomain(form.subdomain) ? 'input-invalid' : ''}
                   onChange={e => setField('subdomain', e.target.value.toLowerCase().replace(/[^a-z0-9\-]/g,'').replace(/^-+/,''))} />
-                <span className="field-suf">.yourdomain.com</span>
+                <span className="field-suf">{domainSuffix}</span>
               </div>
               {form.subdomain && !validateSubdomain(form.subdomain) && (
                 <div className="field-err">Use lowercase letters, numbers, and hyphens only</div>
@@ -1488,7 +1987,8 @@ function ServicesPanel({ toast, onMutate }) {
       )}
 
       {showBatch && (
-        <Modal title="Batch Import Services" onClose={() => { setShowBatch(false); setBatchPlan(null); }} wide>
+        <Modal title="Batch Import Services" onClose={() => { setShowBatch(false); setBatchPlan(null); setBatchError(''); }} wide>
+          <ModalError error={batchError} onDismiss={() => setBatchError('')} />
           <div className="field">
             <label>JSON Array</label>
             <textarea
@@ -1535,16 +2035,7 @@ function ServicesPanel({ toast, onMutate }) {
             <div style={{ marginTop: '6px' }}>URL: <span className="mono">https://{created.domain}</span></div>
           </div>
 
-          <div className="section-label">Optional checklist</div>
-          <div className="field-hint">
-            □ Add an Uptime Kuma monitor for <span className="mono">https://{created.domain}</span>
-              {scan?.uptime_kuma_url ? <> — <a href={scan.uptime_kuma_url} target="_blank" rel="noreferrer" className="mono">open</a></> : null}
-              <br/>
-            □ Add a tile/link in Homepage for <span className="mono">{created.domain}</span>
-              {scan?.homepage_url ? <> — <a href={scan.homepage_url} target="_blank" rel="noreferrer" className="mono">open</a></> : null}
-              <br/>
-            □ If this is a new app: complete its first-run wizard and change default credentials
-          </div>
+          <ServiceCreatedChecklist created={created} integrations={scan} toast={toast} />
 
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={() => {
@@ -1564,31 +2055,70 @@ function ServicesPanel({ toast, onMutate }) {
 
 // ── Integrations health (header) + Activity feed ─────────────────────────────
 
-function IntegrationsHealth() {
-  const [h, setH] = useState(null);
+function HeaderStatusStrip() {
+  const [health, setHealth] = useState(null);
+  const [metrics, setMetrics] = useState(null);
   const tick = useCallback(async () => {
-    try {
-      setH(await api('GET', '/api/integrations/health'));
-    } catch {
-      setH(null);
-    }
+    const [hRes, mRes] = await Promise.allSettled([
+      api('GET', '/api/integrations/health'),
+      api('GET', '/api/metrics'),
+    ]);
+    setHealth(hRes.status === 'fulfilled' ? hRes.value : null);
+    setMetrics(mRes.status === 'fulfilled' ? mRes.value : null);
   }, []);
   useEffect(() => {
     tick();
     const id = setInterval(tick, 45000);
     return () => clearInterval(id);
   }, [tick]);
-  if (!h) return null;
-  const cf = h.cloudflare || {};
-  const npm = h.npm || {};
+  if (!health && !metrics) return null;
+  const cf = health?.cloudflare || {};
+  const npm = health?.npm || {};
+  const apiN = metrics?.http_requests_total ?? 0;
+  const recN = metrics?.reconcile_runs_total ?? 0;
+  const last = metrics?.reconcile_last_iso
+    || (metrics?.reconcile_last_unix != null
+      ? new Date(metrics.reconcile_last_unix * 1000).toLocaleString()
+      : 'never');
+  const metricsTip = `In-memory counters (reset on container restart).\nAPI requests: ${apiN}\nReconcile scans: ${recN}\nLast reconcile: ${last}`;
   return (
-    <div className="health-strip" title={`Last check: ${h.checked_at || ''}`}>
-      <span className={`health-pill ${cf.ok ? 'ok' : 'err'}`}>
-        CF {cf.ok ? 'ok' : 'fail'}{cf.latency_ms != null ? ` ${cf.latency_ms}ms` : ''}
-      </span>
-      <span className={`health-pill ${npm.ok ? 'ok' : 'err'}`}>
-        NPM {npm.ok ? 'ok' : 'fail'}{npm.latency_ms != null ? ` ${npm.latency_ms}ms` : ''}
-      </span>
+    <div className="health-strip">
+      {health && (
+        <>
+          <span className={`health-pill ${cf.ok ? 'ok' : 'err'}`} title={`Last check: ${health.checked_at || ''}`}>
+            CF {cf.ok ? 'ok' : 'fail'}{cf.latency_ms != null ? ` ${cf.latency_ms}ms` : ''}
+          </span>
+          <span className={`health-pill ${npm.ok ? 'ok' : 'err'}`} title={`Last check: ${health.checked_at || ''}`}>
+            NPM {npm.ok ? 'ok' : 'fail'}{npm.latency_ms != null ? ` ${npm.latency_ms}ms` : ''}
+          </span>
+        </>
+      )}
+      {metrics && (
+        <>
+          <span className="health-pill muted" title={metricsTip}>API {apiN}</span>
+          <span className="health-pill muted" title={metricsTip}>Reconcile {recN}</span>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ActivityRow({ ev }) {
+  const [open, setOpen] = useState(false);
+  const summary = formatActivityEvent(ev);
+  const hasDetail = ev.detail && Object.keys(ev.detail).length > 0;
+  return (
+    <div className="activity-row">
+      <div className="activity-ts">{ev.ts}{ev.request_id ? <> · <span style={{ opacity: 0.55 }}>{ev.request_id}</span></> : null}</div>
+      <div>{summary}</div>
+      {hasDetail && (
+        <>
+          <button type="button" className="activity-toggle" onClick={() => setOpen(!open)}>
+            {open ? 'Hide details' : 'Show details'}
+          </button>
+          {open && <div className="activity-detail">{JSON.stringify(ev.detail, null, 2)}</div>}
+        </>
+      )}
     </div>
   );
 }
@@ -1596,13 +2126,15 @@ function IntegrationsHealth() {
 function ActivityPanel({ toast }) {
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
-  const load = useCallback(async () => {
-    setLoading(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const load = useCallback(async (soft) => {
+    if (soft) setRefreshing(true);
+    else setLoading(true);
     try {
       const r = await api('GET', '/api/activity?limit=150');
       setEvents(r.events || []);
     } catch (e) { toast(e.message, 'err'); }
-    finally { setLoading(false); }
+    finally { setLoading(false); setRefreshing(false); }
   }, [toast]);
   useEffect(() => { load(); }, [load]);
   return (
@@ -1610,21 +2142,16 @@ function ActivityPanel({ toast }) {
       <div className="panel-header">
         <div>
           <div className="panel-title">Activity</div>
-          <div className="panel-desc">Recent operations (JSONL on server)</div>
+          <div className="panel-desc">Recent changes made through this console</div>
         </div>
-        <button type="button" className="btn btn-ghost btn-sm" onClick={load}>{loading ? '…' : 'Refresh'}</button>
+        <PanelRefreshButton onClick={() => load(true)} loading={loading} refreshing={refreshing} />
       </div>
       {loading ? <div className="loading">loading</div>
       : events.length === 0 ? <div className="empty">No events yet.</div>
       : (
-        <div className="activity-list">
+        <div className={`activity-list ${refreshing ? 'table-dim' : ''}`}>
           {events.map((ev, i) => (
-            <div className="activity-row" key={`${ev.ts}-${i}`}>
-              <div className="activity-ts">{ev.ts} <span style={{ opacity: 0.55 }}>{ev.request_id}</span></div>
-              <div><span style={{ color: 'var(--accent)' }}>{ev.action}</span>{' '}
-                {ev.detail && <span style={{ color: 'var(--text-3)' }}>{JSON.stringify(ev.detail)}</span>}
-              </div>
-            </div>
+            <ActivityRow key={`${ev.ts}-${i}`} ev={ev} />
           ))}
         </div>
       )}
@@ -1644,6 +2171,8 @@ function App() {
   const [tab, setTab]               = useState('links');
   const [counts, setCounts]         = useState({ links: null, dns: null, services: null });
   const [showSettings, setShowSettings] = useState(false);
+  const [linksListExists, setLinksListExists] = useState(false);
+  const [sessionSecretSource, setSessionSecretSource] = useState('');
   const { toasts, add: toast }      = useToast();
 
   const boot = useCallback(async () => {
@@ -1651,6 +2180,7 @@ function App() {
       const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
       const s = await r.json();
       CSRF_TOKEN = s.csrf_token || '';
+      setSessionSecretSource(s.session_secret_source || '');
       if (!s.configured) {
         setAppState('wizard');
         return;
@@ -1670,16 +2200,20 @@ function App() {
   // Fetch tab badge counts in parallel.  Uses allSettled so one failure
   // doesn't suppress the others (e.g. CF down but NPM still accessible).
   const refreshCounts = useCallback(async () => {
-    const [links, dns, services] = await Promise.allSettled([
+    const [links, dns, scanRes, preRes] = await Promise.allSettled([
       api('GET', '/api/links'),
       api('GET', '/api/dns'),
-      api('GET', '/api/proxy-hosts'),
+      api('GET', '/api/scan'),
+      api('GET', '/api/links/preflight'),
     ]);
     setCounts({
       links:    links.status    === 'fulfilled' ? (links.value.items?.length    ?? 0) : null,
-      dns:      dns.status      === 'fulfilled' ? (dns.value.length             ?? 0) : null,
-      services: services.status === 'fulfilled' ? (services.value.length        ?? 0) : null,
+      dns:      dns.status      === 'fulfilled' ? ((dns.value.records || []).length) : null,
+      services: scanRes.status  === 'fulfilled' ? ((scanRes.value.services || []).length) : null,
     });
+    if (preRes.status === 'fulfilled') {
+      setLinksListExists(!!preRes.value.list_exists);
+    }
   }, []);
 
   useEffect(() => {
@@ -1730,7 +2264,7 @@ function App() {
           <div className="header-sub">app console</div>
         </div>
         <div className="header-spacer" />
-        <IntegrationsHealth />
+        <HeaderStatusStrip />
         <div className="header-status">
           <span className="status-dot" />
           ready
@@ -1751,6 +2285,8 @@ function App() {
           </div>
         ))}
       </nav>
+
+      <GettingStartedBanner listExists={linksListExists} sessionSecretSource={sessionSecretSource} />
 
       <main className="main">
         {/* Each panel mounts on tab activation and unmounts on switch,

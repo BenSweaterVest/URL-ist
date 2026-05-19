@@ -105,7 +105,7 @@ def _write_config_snapshot(prior_path: Path) -> None:
 
     try:
         CONFIG_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
-        ts = time.strftime("%Y%m%d-%H%M%S")
+        ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         snap = CONFIG_HISTORY_DIR / f"config-{ts}.json"
         # Avoid collision in fast consecutive saves
         if snap.exists():
@@ -134,6 +134,7 @@ _activity_lock = threading.Lock()
 _TRASH_LOCK = threading.Lock()
 TRASH_MAX = 20
 _ACTIVITY_MAX_BYTES = 2_000_000
+_ACTIVITY_TRIM_TARGET_BYTES = 1_500_000  # drop oldest lines until at or below this size
 _urler_logging_configured = False
 
 
@@ -174,6 +175,20 @@ def _configure_urler_logging() -> None:
     _urler_logging_configured = True
 
 
+def _trim_activity_log(path: Path) -> None:
+    """Drop oldest events until the log is under the trim target (preserves newest entries)."""
+    if not path.exists():
+        return
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    while lines:
+        body = "\n".join(lines) + "\n"
+        if len(body.encode("utf-8")) <= _ACTIVITY_TRIM_TARGET_BYTES:
+            path.write_text(body, encoding="utf-8")
+            return
+        lines.pop(0)
+    path.write_text("", encoding="utf-8")
+
+
 def emit_activity(action: str, detail: dict[str, Any] | None = None) -> None:
     """Append one JSON line to activity.jsonl (best-effort)."""
     line = {
@@ -188,10 +203,7 @@ def emit_activity(action: str, detail: dict[str, Any] | None = None) -> None:
             path = activity_log_path()
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists() and path.stat().st_size > _ACTIVITY_MAX_BYTES:
-                text = path.read_text(encoding="utf-8")
-                lines = text.splitlines()
-                keep = lines[len(lines) // 2 :]
-                path.write_text("\n".join(keep) + ("\n" if keep else ""), encoding="utf-8")
+                _trim_activity_log(path)
             with path.open("a", encoding="utf-8") as f:
                 f.write(raw)
             try:
@@ -359,10 +371,59 @@ def _session_secret() -> str:
     return secret
 
 
-def _session_signing_is_secure() -> bool:
-    """True when session cookies are not signed by a public/guessable key."""
-    # All sources are acceptable; 'runtime' is still secure (random) but ephemeral.
-    return True
+def _env_int(name: str, default: int, minimum: int) -> int:
+    """Parse a positive integer env var with fallback on missing/invalid values."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return max(minimum, default)
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        logger.warning(f"Invalid {name}={raw!r}; using default {default}")
+        return max(minimum, default)
+
+
+def _sanitize_request_id(raw: str) -> str:
+    """Strip control chars and cap length so client IDs cannot inject logs/headers."""
+    cleaned = re.sub(r"[^\x20-\x7E]", "", raw).strip()
+    return cleaned[:64] if cleaned else secrets.token_hex(8)
+
+
+def _npm_url_ssrf_guard(url: str) -> str:
+    """Block cloud-metadata targets; homelab private NPM IPs remain allowed."""
+    host = (urlparse(url).hostname or "").lower().strip("[]")
+    if not host:
+        raise ValueError("NPM URL must include a hostname")
+    if host in ("metadata", "metadata.google.internal"):
+        raise ValueError("NPM URL cannot target cloud metadata addresses")
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return url
+    if ip.is_link_local:
+        raise ValueError("NPM URL cannot target cloud metadata addresses")
+    return url
+
+
+def _normalize_npm_url(url: str) -> str:
+    v = url.rstrip("/")
+    if not v:
+        return v
+    if not v.startswith(("http://", "https://")):
+        raise ValueError("NPM URL must start with http:// or https://")
+    return _npm_url_ssrf_guard(v)
+
+
+def _reconcile_webhook_url() -> str:
+    """Return validated reconcile webhook URL or empty string if unset/invalid."""
+    hook = os.environ.get("RECONCILE_WEBHOOK_URL", "").strip()
+    if not hook:
+        return ""
+    parsed = urlparse(hook)
+    if parsed.scheme != "https" or not parsed.netloc:
+        logger.warning("RECONCILE_WEBHOOK_URL must be an https:// URL with a host; ignoring")
+        return ""
+    return hook
 
 
 def _ensure_session_secret_in_config(config_data: dict[str, Any], prior: dict[str, Any]) -> None:
@@ -418,15 +479,16 @@ def _trust_proxy_headers() -> bool:
 def _client_ip(request: Request) -> str:
     """Best-effort client IP for rate limiting.
 
-    If TRUST_PROXY_HEADERS is enabled, uses the first IP in X-Forwarded-For.
-    Otherwise falls back to request.client.host (often the reverse proxy IP).
+    If TRUST_PROXY_HEADERS is enabled, uses the **last** IP in X-Forwarded-For
+    (the one your trusted reverse proxy appended). The first hop is client-controlled
+    and must not be used for rate limiting when proxies do not strip XFF.
     """
     if _trust_proxy_headers():
         xff = request.headers.get("x-forwarded-for", "")
         if xff:
-            first = xff.split(",")[0].strip()
-            if first:
-                return first
+            parts = [p.strip() for p in xff.split(",") if p.strip()]
+            if parts:
+                return parts[-1]
     return request.client.host if request.client else "unknown"
 
 
@@ -482,6 +544,8 @@ class Config:
     console_password_hash: str = ""
     uptime_kuma_url: str = ""
     homepage_url: str = ""
+    dockge_url: str = ""
+    wiki_url: str = ""
 
     # ── Derived properties ────────────────────────────────────────────────────
 
@@ -510,10 +574,11 @@ class Config:
             and self.npm_password
             and self.domain
             and self.npm_url
+            and self.npm_cert_id >= 1
         )
 
     def missing_fields(self) -> list[str]:
-        """Names of required fields that are currently empty."""
+        """Names of required fields that are currently empty or invalid."""
         required = {
             "cf_api_token": self.cf_api_token,
             "cf_account_id": self.cf_account_id,
@@ -523,7 +588,10 @@ class Config:
             "npm_password": self.npm_password,
             "domain": self.domain,
         }
-        return [k for k, v in required.items() if not v]
+        missing = [k for k, v in required.items() if not v]
+        if self.npm_cert_id < 1:
+            missing.append("npm_cert_id")
+        return missing
 
 
 # Global config instance — mutated by _load_config() and save_config().
@@ -579,15 +647,29 @@ def _load_config() -> None:
         """Read key from config file, then env var (UPPER_CASE), then default."""
         return str(file_data.get(key) or os.environ.get(key.upper(), default) or default)
 
-    # Parse npm_cert_id separately because it needs an int conversion.
+    # Parse npm_cert_id separately — invalid/zero blocks is_configured() (no silent default).
+    if "npm_cert_id" in file_data:
+        cert_raw = file_data.get("npm_cert_id")
+    elif os.environ.get("NPM_CERT_ID") is not None:
+        cert_raw = os.environ.get("NPM_CERT_ID")
+    else:
+        cert_raw = "2"
     try:
-        raw_cert = int(file_data.get("npm_cert_id") or os.environ.get("NPM_CERT_ID", "2") or "2")
-        npm_cert_id = max(raw_cert, 1)  # silently clamp — 0 = no cert, not supported
-        if raw_cert < 1:
-            logger.warning(f"NPM_CERT_ID was {raw_cert}; clamped to 1")
+        npm_cert_id = int(cert_raw)  # type: ignore[arg-type]
     except (ValueError, TypeError):
-        logger.warning("NPM_CERT_ID is not a valid integer; using default 2")
-        npm_cert_id = 2
+        logger.error(
+            "NPM_CERT_ID=%r is not a valid integer — set npm_cert_id >= 1 in config or NPM_CERT_ID env",
+            cert_raw,
+        )
+        npm_cert_id = 0
+    else:
+        if npm_cert_id < 1:
+            logger.error(
+                "NPM_CERT_ID=%s is invalid (must be >= 1 — find your wildcard cert ID in NPM → SSL Certificates). "
+                "Service creation is disabled until config.json or NPM_CERT_ID is fixed.",
+                npm_cert_id,
+            )
+            npm_cert_id = 0
 
     config = Config(
         cf_api_token=_get("cf_api_token"),
@@ -603,6 +685,8 @@ def _load_config() -> None:
         console_password_hash=_get("console_password_hash", ""),
         uptime_kuma_url=_get("uptime_kuma_url", ""),
         homepage_url=_get("homepage_url", ""),
+        dockge_url=_get("dockge_url", ""),
+        wiki_url=_get("wiki_url", ""),
     )
 
     if not config.console_password_hash:
@@ -648,7 +732,7 @@ def _resolve(proposed: str, current: str) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load config, log startup state, verify Cloudflare if configured."""
-    global _cf_client, _npm_client, _reconcile_task, _reconcile_task
+    global _cf_client, _npm_client, _reconcile_task
     _configure_urler_logging()
     _load_config()
     _cf_client = httpx.AsyncClient(timeout=10.0)
@@ -710,7 +794,10 @@ async def security_gate(request: Request, call_next):
         return await call_next(request)
 
     if not config.is_configured():
-        if path.startswith("/api/config"):
+        # Wizard-only routes — do not expose /api/config/export or other config/* helpers.
+        if path in ("/api/config", "/api/config/status"):
+            return await call_next(request)
+        if path == "/api/config/test" and request.method == "POST":
             return await call_next(request)
         return JSONResponse(
             status_code=503,
@@ -737,7 +824,7 @@ async def add_request_id(request: Request, call_next):
     path = request.url.path
     if not path.startswith("/api/"):
         return await call_next(request)
-    rid = (request.headers.get("x-request-id") or "").strip() or secrets.token_hex(8)
+    rid = _sanitize_request_id(request.headers.get("x-request-id") or "")
     request.state.request_id = rid
     token = _request_id_ctx.set(rid)
     try:
@@ -793,6 +880,86 @@ async def cf_request(method: str, path: str, **kwargs) -> Any:
     except httpx.RequestError as e:
         logger.error(f"Cloudflare unreachable: {e}")
         raise HTTPException(status_code=503, detail=f"Cannot reach Cloudflare: {str(e)}") from None
+
+
+_CF_DNS_PAGE_SIZE = 100
+_CF_DNS_MAX_PAGES = 100  # up to 10_000 A records
+_CF_LIST_ITEMS_PAGE_SIZE = 500
+_CF_LIST_ITEMS_MAX_PAGES = 50  # up to 25_000 items
+
+
+async def _cf_fetch_zone_dns_a_records() -> tuple[list[dict[str, Any]], bool]:
+    """Fetch all zone A records, following Cloudflare page-based pagination."""
+    all_records: list[dict[str, Any]] = []
+    page = 1
+    truncated = False
+    while page <= _CF_DNS_MAX_PAGES:
+        data = await cf_request(
+            "GET",
+            f"/zones/{config.cf_zone_id}/dns_records",
+            params={
+                "per_page": _CF_DNS_PAGE_SIZE,
+                "page": page,
+                "order": "name",
+                "type": "A",
+            },
+        )
+        batch = data.get("result", [])
+        all_records.extend(batch)
+        info = data.get("result_info") or {}
+        total_pages = int(info.get("total_pages") or 1)
+        if page >= total_pages or not batch:
+            break
+        page += 1
+    else:
+        truncated = True
+    return all_records, truncated
+
+
+async def _cf_fetch_list_items(list_id: str) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch all bulk-redirect list items (cursor-first, then page-based fallback)."""
+    all_items: list[dict[str, Any]] = []
+    cursor: str | None = None
+    page = 1
+    truncated = False
+    path = f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items"
+    for _ in range(_CF_LIST_ITEMS_MAX_PAGES):
+        params: dict[str, Any] = {"per_page": _CF_LIST_ITEMS_PAGE_SIZE}
+        if cursor:
+            params["cursor"] = cursor
+        else:
+            params["page"] = page
+        data = await cf_request("GET", path, params=params)
+        batch = list(data.get("result") or [])
+        if not batch:
+            break
+        all_items.extend(batch)
+        info = data.get("result_info") or {}
+        after = (info.get("cursors") or {}).get("after")
+        if after:
+            cursor = str(after)
+            page = 1
+            continue
+        total_pages = int(info.get("total_pages") or 1)
+        if page >= total_pages:
+            break
+        page += 1
+        cursor = None
+    else:
+        truncated = True
+    return all_items, truncated
+
+
+async def _cf_get_list_item(list_id: str, item_id: str) -> dict[str, Any]:
+    """Fetch one bulk-redirect list item by ID (avoids paging the full list)."""
+    data = await cf_request(
+        "GET",
+        f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items/{item_id}",
+    )
+    item = data.get("result")
+    if not item or not isinstance(item, dict):
+        raise HTTPException(status_code=404, detail="Short link item not found")
+    return item
 
 
 async def get_list_id() -> str | None:
@@ -886,7 +1053,7 @@ async def npm_request(method: str, path: str, **kwargs) -> Any:
 
 # ── Input validation helpers ───────────────────────────────────────────────────
 
-_CF_ID_RE = re.compile(r'^[a-f0-9]{1,64}$')
+_CF_ID_RE = re.compile(r"^[a-f0-9]{32}$")
 
 
 def _validate_cf_id(id_value: str, label: str) -> None:
@@ -898,7 +1065,9 @@ def _validate_cf_id(id_value: str, label: str) -> None:
     Cloudflare API.
     """
     if not _CF_ID_RE.match(id_value):
-        raise HTTPException(status_code=400, detail=f"Invalid {label}: must be a hex string")
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {label}: must be a 32-character hex string"
+        )
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -911,11 +1080,13 @@ async def health():
     Always returns 200 — even when unconfigured — so the container is considered
     healthy while the setup wizard is being completed.
     """
+    _, session_source = _session_secret_sources()
     return {
         "status": "ok",
         "service": "console",
         "version": __version__,
         "configured": config.is_configured(),
+        "session_secret_source": session_source,
     }
 
 
@@ -929,12 +1100,14 @@ class LoginBody(BaseModel):
 @app.get("/api/auth/status")
 async def auth_status(request: Request):
     """Return bootstrap and login state for the SPA (no authentication required)."""
+    _, session_source = _session_secret_sources()
     return {
         "configured": config.is_configured(),
         "missing_fields": config.missing_fields(),
         "authenticated": bool(request.session.get("authenticated")),
         "login_required": _login_required(),
         "csrf_token": _csrf_token(request) if request.session.get("authenticated") else "",
+        "session_secret_source": session_source,
     }
 
 
@@ -1049,6 +1222,8 @@ async def get_config():
         "console_password_set": bool(config.console_password_hash or _console_password_env),
         "uptime_kuma_url": config.uptime_kuma_url,
         "homepage_url": config.homepage_url,
+        "dockge_url": config.dockge_url,
+        "wiki_url": config.wiki_url,
     }
 
 
@@ -1079,6 +1254,8 @@ class ConfigProposal(BaseModel):
     console_password_confirm: str = ""
     uptime_kuma_url: str = ""
     homepage_url: str = ""
+    dockge_url: str = ""
+    wiki_url: str = ""
 
     @field_validator("npm_cert_id")
     @classmethod
@@ -1091,11 +1268,8 @@ class ConfigProposal(BaseModel):
     @classmethod
     def validate_npm_url(cls, v: str) -> str:
         if not v:
-            return v  # empty allowed; is_configured() enforces the required check
-        v = v.rstrip("/")
-        if not v.startswith(("http://", "https://")):
-            raise ValueError("NPM URL must start with http:// or https://")
-        return v
+            return v
+        return _normalize_npm_url(v)
 
 
 class ConfigTestProposal(BaseModel):
@@ -1110,6 +1284,20 @@ class ConfigTestProposal(BaseModel):
     short_domain: str = ""
     cf_list_name: str = "shortlinks"
 
+    @field_validator("npm_cert_id")
+    @classmethod
+    def validate_cert_id(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("NPM cert ID must be >= 1 (0 = no SSL, not supported here)")
+        return v
+
+    @field_validator("npm_url")
+    @classmethod
+    def validate_npm_url(cls, v: str) -> str:
+        if not v:
+            return v
+        return _normalize_npm_url(v)
+
 
 @app.post("/api/config/test")
 async def test_config(proposal: ConfigTestProposal):
@@ -1117,7 +1305,8 @@ async def test_config(proposal: ConfigTestProposal):
 
     Performs a live check against both services without saving anything.
     Returns per-service results so the wizard can give specific feedback.
-    Always accessible regardless of configuration state.
+    Unauthenticated only before first-time setup (/api/config* while unconfigured);
+    after configuration, requires an authenticated session like other /api/config routes.
     """
     # Resolve masked fields against current config.  When called from the settings
     # modal, the form contains masked display values from GET /api/config.
@@ -1205,10 +1394,10 @@ async def save_config(proposal: ConfigProposal):
     if new_pw:
         if new_pw != proposal.console_password_confirm.strip():
             raise HTTPException(status_code=400, detail="Console passwords do not match")
-        if len(new_pw) < 8:
+        if len(new_pw) < 12:
             raise HTTPException(
                 status_code=400,
-                detail="Console password must be at least 8 characters",
+                detail="Console password must be at least 12 characters",
             )
         final_hash = _hash_console_password(new_pw)
 
@@ -1232,6 +1421,8 @@ async def save_config(proposal: ConfigProposal):
         "console_password_hash": final_hash,
         "uptime_kuma_url": proposal.uptime_kuma_url.strip(),
         "homepage_url": proposal.homepage_url.strip(),
+        "dockge_url": proposal.dockge_url.strip(),
+        "wiki_url": proposal.wiki_url.strip(),
     }
 
     if final_hash:
@@ -1274,12 +1465,12 @@ async def list_links():
     list_id = await get_list_id()
     if not list_id:
         return {"items": [], "list_exists": False}
-    data = await cf_request(
-        "GET",
-        f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
-        params={"per_page": 500},
-    )
-    return {"items": data.get("result", []), "list_exists": True}
+    items, truncated = await _cf_fetch_list_items(list_id)
+    return {
+        "items": items,
+        "list_exists": True,
+        "truncated": truncated,
+    }
 
 
 @app.get("/api/links/preflight")
@@ -1482,15 +1673,7 @@ async def update_link(item_id: str, payload: LinkUpdate):
     if not list_id:
         raise HTTPException(404, "Shortlink list not found")
 
-    data = await cf_request(
-        "GET",
-        f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
-        params={"per_page": 500},
-    )
-    items = data.get("result", [])
-    existing = next((i for i in items if i.get("id") == item_id), None)
-    if not existing:
-        raise HTTPException(status_code=404, detail="Short link item not found")
+    existing = await _cf_get_list_item(list_id, item_id)
 
     source_url = str((existing.get("redirect") or {}).get("source_url", ""))
     old_target = str((existing.get("redirect") or {}).get("target_url", ""))
@@ -1517,7 +1700,7 @@ async def update_link(item_id: str, payload: LinkUpdate):
             json=[
                 {
                     "redirect": {
-                        "source_url": f"https://{config.short_domain}/{slug}",
+                        "source_url": source_url,
                         "target_url": payload.target,
                         "status_code": status_code,
                     },
@@ -1551,19 +1734,35 @@ async def update_link(item_id: str, payload: LinkUpdate):
 # ── DNS Records ───────────────────────────────────────────────────────────────
 
 
+async def _npm_proxy_domain_names() -> set[str]:
+    """Domain names with an NPM proxy host (for DNS delete guardrails)."""
+    try:
+        hosts = await npm_request("GET", "/api/nginx/proxy-hosts")
+    except HTTPException:
+        return set()
+    names: set[str] = set()
+    for host in hosts:
+        domain = (host.get("domain_names") or [None])[0]
+        if domain:
+            names.add(str(domain).lower())
+    return names
+
+
 @app.get("/api/dns")
 async def list_dns():
     """List all A records in the zone, ordered by name.
 
-    Only A records are returned — this console manages services via A records.
-    Capped at 100 records (well above any realistic home zone size).
+    Only A records are returned. Follows Cloudflare pagination so zones with
+    more than 100 A records are fully listed (unless an internal safety cap is hit).
+    Includes npm_proxy_domains so the UI can warn before deleting records tied to services.
     """
-    data = await cf_request(
-        "GET",
-        f"/zones/{config.cf_zone_id}/dns_records",
-        params={"per_page": 100, "order": "name", "type": "A"},
-    )
-    return data.get("result", [])
+    records, truncated = await _cf_fetch_zone_dns_a_records()
+    npm_domains = await _npm_proxy_domain_names()
+    return {
+        "records": records,
+        "truncated": truncated,
+        "npm_proxy_domains": sorted(npm_domains),
+    }
 
 
 class DNSCreate(BaseModel):
@@ -1695,16 +1894,8 @@ async def scan():
       npm_host         The NPM IP from config, so the frontend can use the correct
                        IP when creating DNS records without hardcoding it.
     """
-    cf_data, npm_hosts = await asyncio.gather(
-        cf_request(
-            "GET",
-            f"/zones/{config.cf_zone_id}/dns_records",
-            params={"per_page": 100, "order": "name", "type": "A"},
-        ),
-        npm_request("GET", "/api/nginx/proxy-hosts"),
-    )
-
-    dns_records: list[dict] = cf_data.get("result", [])
+    dns_records, dns_truncated = await _cf_fetch_zone_dns_a_records()
+    npm_hosts = await npm_request("GET", "/api/nginx/proxy-hosts")
 
     # Domain → DNS record for O(1) cross-referencing
     dns_by_domain: dict[str, dict] = {r["name"]: r for r in dns_records}
@@ -1742,6 +1933,9 @@ async def scan():
         "npm_host": config.npm_host,  # for frontend use in "Add DNS" action
         "uptime_kuma_url": config.uptime_kuma_url,
         "homepage_url": config.homepage_url,
+        "dockge_url": config.dockge_url,
+        "wiki_url": config.wiki_url,
+        "dns_truncated": dns_truncated,
     }
 
 
@@ -1750,8 +1944,8 @@ _reconcile_task: asyncio.Task[Any] | None = None
 
 async def _reconcile_loop() -> None:
     """Periodic drift scan + optional webhook when issues exist."""
-    interval = max(60, int(os.environ.get("RECONCILE_INTERVAL_SEC", "3600")))
-    initial = max(30, int(os.environ.get("RECONCILE_INITIAL_DELAY_SEC", "120")))
+    interval = _env_int("RECONCILE_INTERVAL_SEC", 3600, 60)
+    initial = _env_int("RECONCILE_INITIAL_DELAY_SEC", 120, 30)
     await asyncio.sleep(initial)
     while True:
         try:
@@ -1771,11 +1965,12 @@ async def _reconcile_loop() -> None:
                         int(_metrics.get("reconcile_runs_total", 0)) + 1
                     )
                     _metrics["reconcile_last_unix"] = int(time.time())
-                    emit_activity(
-                        "reconcile.scan",
-                        {"unmatched_dns": ud, "missing_dns_services": md},
-                    )
-                    hook = os.environ.get("RECONCILE_WEBHOOK_URL", "").strip()
+                    if ud or md:
+                        emit_activity(
+                            "reconcile.scan",
+                            {"unmatched_dns": ud, "missing_dns_services": md},
+                        )
+                    hook = _reconcile_webhook_url()
                     if hook and (ud or md):
                         try:
                             async with httpx.AsyncClient(timeout=15.0) as wh:
@@ -1864,6 +2059,15 @@ class ServiceBatchRequest(BaseModel):
     items: list[ServiceCreate]
     dry_run: bool = True
     continue_on_error: bool = False
+
+    @field_validator("items")
+    @classmethod
+    def validate_items_cap(cls, v: list[ServiceCreate]) -> list[ServiceCreate]:
+        if not v:
+            raise ValueError("No items provided")
+        if len(v) > 100:
+            raise ValueError("Batch import is limited to 100 items per request")
+        return v
 
 
 def _host_to_service_create(host: dict[str, Any], domain: str) -> ServiceCreate | None:
@@ -1992,15 +2196,11 @@ async def batch_services(payload: ServiceBatchRequest):
         raise HTTPException(status_code=400, detail="No items provided")
 
     # Gather existing domains for conflict warnings in dry-run.
-    cf_data, npm_hosts = await asyncio.gather(
-        cf_request(
-            "GET",
-            f"/zones/{config.cf_zone_id}/dns_records",
-            params={"per_page": 100, "order": "name", "type": "A"},
-        ),
+    (dns_list, _), npm_hosts = await asyncio.gather(
+        _cf_fetch_zone_dns_a_records(),
         npm_request("GET", "/api/nginx/proxy-hosts"),
     )
-    existing_dns = {r.get("name") for r in cf_data.get("result", [])}
+    existing_dns = {r.get("name") for r in dns_list}
     existing_npm = {((h.get("domain_names") or [None])[0]) for h in npm_hosts}
 
     plan: list[dict[str, Any]] = []
@@ -2171,6 +2371,19 @@ async def set_service_enabled(proxy_host_id: int, payload: ServiceEnabledUpdate)
         raise HTTPException(status_code=404, detail="Proxy host not found")
 
     update_body: dict[str, Any] = {k: v for k, v in host.items() if k in _SAFE_NPM_PUT_KEYS}
+    _npm_put_defaults: dict[str, Any] = {
+        "block_exploits": True,
+        "access_list_id": 0,
+        "meta": {},
+        "locations": [],
+        "http2_support": False,
+        "ssl_forced": True,
+        "allow_websocket_upgrade": False,
+        "advanced_config": "",
+    }
+    for key, default in _npm_put_defaults.items():
+        if key in _SAFE_NPM_PUT_KEYS and key not in update_body:
+            update_body[key] = default
     update_body["enabled"] = payload.enabled
 
     result = await npm_request("PUT", f"/api/nginx/proxy-hosts/{proxy_host_id}", json=update_body)
@@ -2232,7 +2445,8 @@ async def integrations_health():
 
     t1 = time.perf_counter()
     try:
-        await npm_request("GET", "/api/nginx/proxy-hosts")
+        # Lightweight settings read — confirms auth + API without listing all proxy hosts.
+        await npm_request("GET", "/api/nginx/settings")
         out["npm"] = {"ok": True, "latency_ms": int((time.perf_counter() - t1) * 1000)}
     except HTTPException as e:
         out["npm"] = {
@@ -2250,8 +2464,16 @@ async def integrations_health():
 
 @app.get("/api/metrics")
 async def get_metrics():
-    """Lightweight counters for monitoring (in-memory; reset on restart)."""
-    return dict(_metrics)
+    """Lightweight counters for monitoring (in-memory; reset on container restart).
+
+    Exposed in the console header next to integration health. Safe to scrape
+    periodically; values are not persisted to disk.
+    """
+    out = dict(_metrics)
+    last = out.get("reconcile_last_unix")
+    if isinstance(last, int):
+        out["reconcile_last_iso"] = datetime.fromtimestamp(last, UTC).isoformat()
+    return out
 
 
 @app.get("/api/config/export")

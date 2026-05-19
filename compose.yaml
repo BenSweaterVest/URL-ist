@@ -1,83 +1,81 @@
-# URLer — Docker Compose
-# ======================================
-# Unified management console for short links, DNS records, and NPM services.
-# Deploy on your Docker host; expose internally via your reverse proxy.
-#
-# ── First-run setup (no pre-configuration needed) ──────────────────────────
-# Deploy the stack, then open http://<your-server-ip>:8099 in your browser.
-# The setup wizard will prompt for a console password, then Cloudflare and NPM
-# credentials, test them, and save them to /data/config.json (persisted by the volume).
-#
-# After the wizard completes:
-#   1. Use the Services tab to register URLer itself:
-#        Subdomain:    urler
-#        Backend host: <your-server-ip>
-#        Backend port: 8099
-#      This creates the DNS record AND the NPM proxy host in one step.
-#
-#   2. Short links need a one-time Tofu bootstrap to create the Cloudflare
-#      list and redirect ruleset:
-#        cd tofu/ && tofu apply
-#      The Short Links tab shows a setup notice until this is done.
-#
-# ── Skipping the wizard ─────────────────────────────────────────────────────
-# To pre-configure instead of using the wizard, uncomment and populate the
-# environment section below.  The wizard is bypassed if all required vars
-# are present at startup.
-#
-# ── CF_API_TOKEN permissions required ──────────────────────────────────────
-#   Zone > DNS > Edit
-#   Account > Account Filter Lists > Edit   (short links)
-#   Account > Account Rulesets > Edit        (Tofu bootstrap only)
-
-services:
-  urler:
-    build: .
-    container_name: urler
-    restart: unless-stopped
-    ports:
-      - "8099:8000"
-    volumes:
-      - urler_data:/data   # persists config.json across container restarts
-
-    # Uncomment ONE environment block below. For production, set SESSION_SECRET
-    # (e.g. openssl rand -hex 32) so login cookies cannot be forged.
-    #
-    # environment:
-    #   SESSION_SECRET: "paste-a-long-random-string-here"
-    #
-    # Uncomment to skip the setup wizard and pre-configure via environment:
-    # environment:
-    #   SESSION_SECRET: ""         # recommended — see README
-    #   SESSION_COOKIE_HTTPS_ONLY: "1"   # when users only reach the UI over https://
-    #   SESSION_COOKIE_SAMESITE: "lax"  # lax|strict|none
-    #   TRUST_PROXY_HEADERS: "1"        # if behind NPM, trust X-Forwarded-For for rate limiting
-    #   CF_API_TOKEN:  ""          # required
-    #   CF_ACCOUNT_ID: ""          # required
-    #   CF_ZONE_ID:    ""          # required
-    #   NPM_EMAIL:     ""          # required
-    #   NPM_PASSWORD:  ""          # required
-    #   NPM_URL:       "http://192.168.1.1:81"    # your NPM internal URL
-    #   DOMAIN:        "example.com"              # your domain
-    #   SHORT_DOMAIN:  "short.example.com"        # subdomain for short links
-    #   CF_LIST_NAME:  "shortlinks"               # must be alphanumeric + underscores
-    #   NPM_CERT_ID:   "2"         # wildcard cert ID in NPM
-    #   CONSOLE_PASSWORD: ""       # optional plaintext console login when using env-only bootstrap
-    #   CONFIG_HISTORY_LIMIT: "100" # keep last N config snapshots in /data/config-versions (0 disables)
-
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-
-volumes:
-  urler_data:
-    # Config is stored in a named Docker volume by default.
-    # To use a host path instead (easier to inspect/back up), replace with:
-    #   driver: local
-    #   driver_opts:
-    #     type: none
-    #     o: bind
-    #     device: /home/youruser/stacks/urler/data
+# URLer — Docker Compose
+# ======================================
+# Unified management console for short links, DNS records, and NPM services.
+# Deploy on your Docker host; expose internally via your reverse proxy.
+#
+# ── First-run setup (no pre-configuration needed) ──────────────────────────
+# Deploy the stack, then open http://<your-server-ip>:8099 in your browser.
+# The setup wizard will prompt for a console password, then Cloudflare and NPM
+# credentials, test them, and save them to /data/config.json (persisted by the volume).
+#
+# After the wizard completes:
+#   1. Use the Services tab to register URLer itself:
+#        Subdomain:    urler
+#        Backend host: <your-server-ip>
+#        Backend port: 8099
+#      This creates urler.yourdomain.com (DNS + NPM proxy host) in one step.
+#
+#   2. Short links need a one-time Tofu bootstrap:
+#        cd tofu/ && tofu apply
+#      The Short Links tab shows a setup notice until this is done.
+#
+# ── Optional environment variables (skip wizard) ───────────────────────────
+# Uncomment the single `environment:` block below. See README for details.
+# NPM_CERT_ID must be >= 1 (your wildcard certificate ID in NPM — not 0).
+#
+# ── CF_API_TOKEN permissions required ──────────────────────────────────────
+#   Zone > DNS > Edit
+#   Account > Account Filter Lists > Edit   (short links)
+#   Account > Account Rulesets > Edit        (Tofu bootstrap only)
+
+services:
+  urler:
+    build: .
+    container_name: urler
+    restart: unless-stopped
+    ports:
+      - "8099:8000"
+    volumes:
+      - urler_data:/data   # persists config.json across container restarts
+
+    # environment:
+    #   # Session / security (recommended in production)
+    #   SESSION_SECRET: "paste-a-long-random-string-here"   # openssl rand -hex 32
+    #   SESSION_COOKIE_HTTPS_ONLY: "1"   # when users only reach the UI over https://
+    #   SESSION_COOKIE_SAMESITE: "lax"    # lax | strict | none
+    #   TRUST_PROXY_HEADERS: "1"          # behind NPM: use last X-Forwarded-For hop for rate limits
+    #   # Cloudflare + NPM (required to skip the wizard)
+    #   CF_API_TOKEN: ""
+    #   CF_ACCOUNT_ID: ""
+    #   CF_ZONE_ID: ""
+    #   NPM_EMAIL: ""
+    #   NPM_PASSWORD: ""
+    #   NPM_URL: "http://192.168.1.1:81"
+    #   DOMAIN: "example.com"
+    #   SHORT_DOMAIN: "short.example.com"
+    #   CF_LIST_NAME: "shortlinks"
+    #   NPM_CERT_ID: "2"                  # wildcard cert ID in NPM (must be >= 1)
+    #   CONSOLE_PASSWORD: ""              # optional bootstrap password before first wizard save
+    #   CONFIG_HISTORY_LIMIT: "100"       # config snapshots in /data/config-versions (0 = off)
+    #   # Background reconcile (see README)
+    #   RECONCILE_INTERVAL_SEC: "3600"
+    #   RECONCILE_INITIAL_DELAY_SEC: "120"
+    #   RECONCILE_WEBHOOK_URL: "https://hooks.example.com/urler-reconcile"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  urler_data:
+    # Config is stored in a named Docker volume by default.
+    # To use a host path instead (easier to inspect/back up), replace with:
+    #   driver: local
+    #   driver_opts:
+    #     type: none
+    #     o: bind
+    #     device: /home/youruser/stacks/urler/data
+

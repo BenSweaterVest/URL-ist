@@ -68,12 +68,12 @@ def configured_client(client: TestClient) -> TestClient:
         "domain": "example.com",
         "short_domain": "",
         "cf_list_name": "shortlinks",
-        "console_password": "testpass12",
-        "console_password_confirm": "testpass12",
+        "console_password": "testpass1234",
+        "console_password_confirm": "testpass1234",
     }
     r_cfg = client.post("/api/config", json=body)
     assert r_cfg.status_code == 200, r_cfg.text
-    assert client.post("/api/auth/login", json={"password": "testpass12"}).status_code == 200
+    assert client.post("/api/auth/login", json={"password": "testpass1234"}).status_code == 200
     return client
 
 

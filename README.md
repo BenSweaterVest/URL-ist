@@ -8,13 +8,15 @@ A self-hosted management console for [Cloudflare](https://cloudflare.com) + [Ngi
 |-------|-------------|
 | **Short Links** | Create, edit, and delete `short.yourdomain.com/slug → destination` redirects via Cloudflare Bulk Redirects (302 by default so edits work after a browser has visited the slug) |
 | **DNS** | View, add, and delete Cloudflare A records for your zone |
-| **Services** | Create services (DNS + NPM proxy host), delete them together, enable/disable proxy hosts, or batch-import from JSON with dry-run preview |
+| **Services** | Create services (DNS + NPM proxy host), delete them together, enable/disable proxy hosts, restore from trash, or batch-import from JSON with dry-run preview |
+| **Activity** | Recent operator actions (links, DNS, services, reconcile) with expandable JSON detail |
 
 ### What each panel does
 
-- **Short Links** — Add slugs, change destinations in place, delete entries. Preflight checks list + DNS readiness. Requires one-time Tofu bootstrap.
-- **DNS** — Manage A records. Warns before deleting the short-links domain record.
-- **Services** — One form creates `subdomain.domain` DNS (→ NPM) and an NPM proxy host (→ your backend). Delete removes NPM host and DNS (with warnings on partial failure). Toggle enables/disables the NPM proxy without deleting DNS. **Batch Import** accepts a JSON array, preview, then apply. After creating a service, optional checklists link to Uptime Kuma and Homepage if you configured those URLs in Settings.
+- **Short Links** — Add slugs (choose redirect status 301/302/307/308 on create; default 302), change destinations in place, delete entries. Preflight checks list + DNS readiness. Requires one-time Tofu bootstrap.
+- **DNS** — Manage A records (full zone list via API pagination; table pages locally when there are many rows). Warns before deleting the short-links domain record or any name that still has an NPM proxy host (use Services to remove both).
+- **Services** — One form creates `subdomain.domain` DNS (→ NPM) and an NPM proxy host (→ your backend). Delete removes NPM host and DNS (with warnings on partial failure); recently deleted entries can be **restored** from a trash snapshot. Toggle enables/disables the NPM proxy without deleting DNS. **Batch Import** accepts a JSON array (`subdomain`, `forward_host`, `forward_port`, optional `forward_scheme`), dry-run preview, then apply (failures stay visible in the modal). After creating a service, a homelab checklist links to Dockge, Uptime Kuma (`/add`), Homepage (copy-paste `services.yaml` snippet), and TiddlyWiki when those URLs are set in Settings.
+- **Activity** — Append-only log of changes (stored as JSON lines under `/data/activity.jsonl`). When the log exceeds ~2 MB, **oldest** events are removed first (newest entries are kept). The **Settings → Test connections** panel and **`GET /api/integrations/health`** report Cloudflare/NPM reachability. The header also shows in-memory **`/api/metrics`** counters (API requests and reconcile runs since container start).
 
 **Architecture:**
 ```
@@ -130,18 +132,36 @@ Settings are saved to `/data/config.json` inside the container (persisted via Do
 | **Base Domain** | Your domain, e.g. `example.com` — new services become `subdomain.example.com` | ✓ |
 | **Short Links Domain** | Full short link domain, e.g. `short.example.com` | For short links |
 | **CF List Name** | Cloudflare list name — must match `cf_list_name` in `terraform.tfvars` | For short links |
-| **NPM Cert ID** | ID of the wildcard SSL certificate in NPM (find in NPM → SSL Certificates) | For new services |
-| **Uptime Kuma URL** | Base URL of your Uptime Kuma instance (optional; used in post-create checklists) | Optional |
-| **Homepage URL** | Base URL of your Homepage dashboard (optional; used in post-create checklists) | Optional |
+| **NPM Cert ID** | ID of the wildcard SSL certificate in NPM (find in NPM → SSL Certificates). Must be **≥ 1** — `0` is not valid for service creation. | For new services |
+| **Dockge URL** | Base URL of Dockge (optional; post-create checklist opens deploy UI) | Optional |
+| **TiddlyWiki URL** | Base URL of your wiki (optional; post-create link to `#New Tiddler`) | Optional |
+| **Uptime Kuma URL** | Base URL of Uptime Kuma (optional; post-create link to `/add` monitor form) | Optional |
+| **Homepage URL** | Base URL of Homepage (optional; post-create copy-paste `services.yaml` snippet) | Optional |
 
 **Editing `config.json` directly:** The app reads settings at startup and when you save via the UI. If you edit `/data/config.json` by hand, restart the container so middleware and in-memory config pick up changes (especially `session_secret`).
 
 **Config history:** Each save via Settings keeps a snapshot under `/data/config-versions/` (see Security section for retention).
 
-**URLer password:** Set in the wizard (stored as a salted hash in `config.json`). Used only to unlock this web UI — it is **not** tied to your Ubuntu `sudo` password (the app runs in Docker and cannot safely verify OS logins). You may reuse the same passphrase if you want, but it is stored separately.
+**URLer password:** Set in the wizard (stored as a salted hash in `config.json`). Minimum **12 characters**. Used only to unlock this web UI — it is **not** tied to your Ubuntu `sudo` password (the app runs in Docker and cannot safely verify OS logins). You may reuse the same passphrase if you want, but it is stored separately.
 
 **Skipping the wizard (env vars):**  
 Uncomment and populate the `environment:` section in `compose.yaml`. The app will start fully configured and skip the wizard. Set **`CONSOLE_PASSWORD`** there if you need a plaintext bootstrap password before the first save to `config.json` (on first successful login, a hash is written and the env-only path is no longer used).
+
+**Background reconcile (optional):** A periodic task compares NPM proxy hosts with Cloudflare DNS and logs drift. Tune with environment variables (see `compose.yaml` comments):
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `RECONCILE_INTERVAL_SEC` | `3600` | Seconds between scans |
+| `RECONCILE_INITIAL_DELAY_SEC` | `120` | Delay before the first scan after startup |
+| `RECONCILE_WEBHOOK_URL` | (empty) | Optional **https://** webhook when unmatched or missing DNS is found |
+
+Webhook JSON body: `{"event": "urler.reconcile", "unmatched_dns": <int>, "missing_dns_services": <int>}`.
+
+Reconcile events appear in the **Activity** tab only when drift is detected (non-zero counts).
+
+**Session signing:** `/api/health` and `/api/auth/status` include `session_secret_source` (`env`, `file`, or `runtime`). If you see `runtime` after saving settings, restart the container once so the session middleware loads the persisted key from `config.json`. The getting-started banner highlights this until you restart.
+
+**Integrations health:** The header CF/NPM pills use a lightweight probe (one DNS record + NPM settings read), not a full proxy-host listing.
 
 **Session signing:** Set **`SESSION_SECRET`** (long random string, ≥16 characters) in `compose.yaml` so session cookies cannot be forged by anyone who can reach the container port. Optional `session_secret` in `config.json` is used as a fallback if `SESSION_SECRET` is not set.
 
@@ -275,6 +295,9 @@ Configuration in `/data/config.json` is preserved across updates.
 ```
 ├── main.py                 FastAPI backend
 ├── requirements.txt        Python dependencies
+├── requirements-dev.txt    pytest, ruff (local/CI)
+├── tests/                  API tests (auth, CSRF, links, preflight)
+├── scripts/                Helper scripts (e.g. vendor frontend assets)
 ├── Dockerfile
 ├── compose.yaml            Docker Compose stack
 ├── .dockerignore           Prevents secrets leaking into Docker build context
@@ -286,6 +309,8 @@ Configuration in `/data/config.json` is preserved across updates.
     ├── terraform.tfvars.example
     └── .gitignore          Excludes terraform.tfvars and state files
 ```
+
+**API auth:** After setup, most `/api/*` routes require a logged-in session and CSRF token on `POST`/`PUT`/`DELETE`. Exceptions include `/api/health`, `/api/config/status`, `/api/auth/*` (login/logout/status), and the first-time wizard (`GET`/`POST /api/config` before configuration).
 
 ---
 
@@ -305,7 +330,7 @@ URLer manages your Cloudflare DNS and API credentials. Keep it internal.
 
 **Login rate limiting**: `/api/auth/login` is limited per client IP (in-memory, resets on container restart) to slow password guessing.
 
-**Behind NPM**: If you proxy through NPM, enable **`TRUST_PROXY_HEADERS=1`** so rate limiting keys off the real client IP from `X-Forwarded-For` (only do this behind a trusted reverse proxy).
+**Behind NPM**: If you proxy through NPM, enable **`TRUST_PROXY_HEADERS=1`** so login rate limiting uses the **last** (trusted) IP in `X-Forwarded-For` — the hop your proxy appended. Configure NPM to **overwrite** `X-Forwarded-For` rather than appending to a client-supplied value, or rate limits can be bypassed.
 
 **Backups**: Back up the Docker volume (or host bind mount) that holds **`/data/config.json`** — it contains Cloudflare/NPM credentials and your console password hash.
 
@@ -318,6 +343,23 @@ URLer manages your Cloudflare DNS and API credentials. Keep it internal.
 **Cloudflare token scoping**: Once Tofu bootstrap is complete, you can remove the `Account Filter Lists` and `Account Rulesets` permissions from your token — the console only writes list *items*, not the list structure. A narrower token limits blast radius if credentials are ever exposed.
 
 **Air-gapped / offline deployments**: The frontend loads React and fonts from CDN by default. For fully offline use, run **`scripts/vendor-frontend.sh`** (or copy the `curl` commands inside it), then point the `<script src>` tags in `static/index.html` at `/static/vendor/...`.
+
+---
+
+## What not to commit
+
+This repository is intended for public GitHub. **Never commit:**
+
+| Never commit | Why |
+|--------------|-----|
+| `config.json`, `/data/*` exports | CF/NPM tokens, console password hash, `session_secret` |
+| `terraform.tfvars`, `.env` | Cloudflare tokens and deploy secrets |
+| `AGENTS.local.md`, `AGENTS.md`, `*.local.md` | Homelab hostnames, LAN IPs, personal domains |
+| `activity.jsonl`, `service-trash.json` | Runtime logs may include domains you manage |
+
+Use **`AGENTS.example.md`** → copy to **`AGENTS.local.md`** for Cursor/agent context with your real values (both filenames are gitignored).
+
+Before pushing: `git status` and confirm no secrets or homelab-specific notes are staged. Test fixtures use fake tokens like `cfat_test` only.
 
 ---
 
