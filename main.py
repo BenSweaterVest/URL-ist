@@ -91,7 +91,7 @@ def _config_history_limit() -> int:
     try:
         return max(0, int(raw))
     except ValueError:
-        logger.warning(f"Invalid CONFIG_HISTORY_LIMIT={raw!r}; using 100")
+        logger.warning("Invalid CONFIG_HISTORY_LIMIT=%r; using 100", raw)
         return 100
 
 
@@ -113,7 +113,7 @@ def _write_config_snapshot(prior_path: Path) -> None:
         snap.write_text(prior_path.read_text(), encoding="utf-8")
         snap.chmod(0o600)
     except OSError as e:
-        logger.warning(f"Could not write config snapshot: {e}")
+        logger.warning("Could not write config snapshot: %s", e)
         return
 
     try:
@@ -211,7 +211,7 @@ def emit_activity(action: str, detail: dict[str, Any] | None = None) -> None:
             except OSError:
                 pass
     except OSError as e:
-        logger.warning(f"activity log write failed: {e}")
+        logger.warning("activity log write failed: %s", e)
 
 
 _health_cache: dict[str, Any] | None = None
@@ -379,7 +379,7 @@ def _env_int(name: str, default: int, minimum: int) -> int:
     try:
         return max(minimum, int(raw))
     except ValueError:
-        logger.warning(f"Invalid {name}={raw!r}; using default {default}")
+        logger.warning("Invalid %s=%r; using default %s", name, raw, default)
         return max(minimum, default)
 
 
@@ -454,7 +454,7 @@ def _session_cookie_same_site() -> str:
     raw = os.environ.get("SESSION_COOKIE_SAMESITE", "lax").strip().lower()
     if raw in ("lax", "strict", "none"):
         return raw
-    logger.warning(f"Invalid SESSION_COOKIE_SAMESITE={raw!r}; using 'lax'")
+    logger.warning("Invalid SESSION_COOKIE_SAMESITE=%r; using 'lax'", raw)
     return "lax"
 
 
@@ -639,9 +639,9 @@ def _load_config() -> None:
     if CONFIG_FILE.exists():
         try:
             file_data = json.loads(CONFIG_FILE.read_text())
-            logger.info(f"Loaded config from {CONFIG_FILE}")
+            logger.info("Loaded config from %s", CONFIG_FILE)
         except Exception as e:
-            logger.warning(f"Could not read config file {CONFIG_FILE}: {e}")
+            logger.warning("Could not read config file %s: %s", CONFIG_FILE, e)
 
     def _get(key: str, default: str = "") -> str:
         """Read key from config file, then env var (UPPER_CASE), then default."""
@@ -739,22 +739,22 @@ async def lifespan(app: FastAPI):
     _npm_client = httpx.AsyncClient(timeout=10.0)
     logger.info("URLer starting")
     if config.is_configured():
-        logger.info(f"  Domain:       {config.domain}")
-        logger.info(f"  Short domain: {config.short_domain}")
-        logger.info(f"  CF list:      {config.cf_list_name}")
-        logger.info(f"  NPM:          {config.npm_url}")
+        logger.info("  Domain:       %s", config.domain)
+        logger.info("  Short domain: %s", config.short_domain)
+        logger.info("  CF list:      %s", config.cf_list_name)
+        logger.info("  NPM:          %s", config.npm_url)
         try:
             list_id = await get_list_id()
             if list_id:
-                logger.info(f"  CF list ID:   {list_id} (found)")
+                logger.info("  CF list ID:   %s (found)", list_id)
             else:
                 logger.warning(
-                    f"  CF list '{config.cf_list_name}' not found — Tofu bootstrap required"
+                    "  CF list '%s' not found — Tofu bootstrap required", config.cf_list_name
                 )
         except Exception as e:
-            logger.warning(f"  Cloudflare connectivity check failed: {e}")
+            logger.warning("  Cloudflare connectivity check failed: %s", e)
     else:
-        logger.warning(f"  Not configured — missing: {', '.join(config.missing_fields())}")
+        logger.warning("  Not configured — missing: %s", ", ".join(config.missing_fields()))
         logger.warning("  Open http://localhost:8000 in your browser to complete setup.")
     _reconcile_task = asyncio.create_task(_reconcile_loop())
     yield
@@ -873,12 +873,12 @@ async def cf_request(method: str, path: str, **kwargs) -> Any:
             msg = errors[0]["message"] if errors else e.response.text
         except Exception:
             msg = e.response.text
-        logger.error(f"Cloudflare {method} {path} → {e.response.status_code}: {msg}")
+        logger.error("Cloudflare %s %s → %s: %s", method, path, e.response.status_code, msg)
         raise HTTPException(
             status_code=e.response.status_code, detail=f"Cloudflare: {msg}"
         ) from None
     except httpx.RequestError as e:
-        logger.error(f"Cloudflare unreachable: {e}")
+        logger.error("Cloudflare unreachable: %s", e)
         raise HTTPException(status_code=503, detail=f"Cannot reach Cloudflare: {str(e)}") from None
 
 
@@ -975,7 +975,7 @@ async def get_list_id() -> str | None:
     for lst in data.get("result", []):
         if lst["name"] == config.cf_list_name:
             _list_id_cache = lst["id"]
-            logger.info(f"Cached CF list ID: {_list_id_cache}")
+            logger.info("Cached CF list ID: %s", _list_id_cache)
             return _list_id_cache
     return None
 
@@ -1042,10 +1042,10 @@ async def npm_request(method: str, path: str, **kwargs) -> Any:
             msg = e.response.json().get("error", e.response.text)
         except Exception:
             msg = e.response.text
-        logger.error(f"NPM {method} {path} → {e.response.status_code}: {msg}")
+        logger.error("NPM %s %s → %s: %s", method, path, e.response.status_code, msg)
         raise HTTPException(status_code=e.response.status_code, detail=f"NPM: {msg}") from None
     except httpx.RequestError as e:
-        logger.error(f"NPM unreachable: {e}")
+        logger.error("NPM unreachable: %s", e)
         raise HTTPException(
             status_code=503, detail=f"Cannot reach NPM at {config.npm_url}: {str(e)}"
         ) from None
@@ -1140,6 +1140,10 @@ async def auth_login(request: Request, body: LoginBody):
                 "domain": config.domain,
                 "short_domain": config.short_domain,
                 "cf_list_name": config.cf_list_name,
+                "uptime_kuma_url": config.uptime_kuma_url,
+                "homepage_url": config.homepage_url,
+                "dockge_url": config.dockge_url,
+                "wiki_url": config.wiki_url,
                 "console_password_hash": new_hash,
             }
             prior_snap: dict[str, Any] = {}
@@ -1637,7 +1641,7 @@ async def create_link(link: LinkCreate):
             }
         ],
     )
-    logger.info(f"Created short link: {source_url} → {link.target}")
+    logger.info("Created short link: %s → %s", source_url, link.target)
     emit_activity("link.created", {"slug": link.slug, "source_url": source_url})
     return data
 
@@ -1654,7 +1658,7 @@ async def delete_link(item_id: str):
         f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
         json={"items": [{"id": item_id}]},
     )
-    logger.info(f"Deleted short link: {item_id}")
+    logger.info("Deleted short link: %s", item_id)
     emit_activity("link.deleted", {"item_id": item_id})
     return {"success": True}
 
@@ -1707,7 +1711,7 @@ async def update_link(item_id: str, payload: LinkUpdate):
                 }
             ],
         )
-        logger.info(f"Updated short link: /{slug} → {payload.target}")
+        logger.info("Updated short link: /%s → %s", slug, payload.target)
         emit_activity("link.updated", {"slug": slug, "item_id": item_id})
         return {"success": True, "slug": slug}
     except HTTPException:
@@ -1727,7 +1731,9 @@ async def update_link(item_id: str, payload: LinkUpdate):
                 ],
             )
         except Exception as restore_err:
-            logger.error(f"Failed to restore short link /{slug} after update error: {restore_err}")
+            logger.error(
+                "Failed to restore short link /%s after update error: %s", slug, restore_err
+            )
         raise
 
 
@@ -1820,7 +1826,7 @@ async def create_dns(record: DNSCreate):
         },
     )
     result = data.get("result", {})
-    logger.info(f"Created DNS record: {result.get('name')} → {target_ip}")
+    logger.info("Created DNS record: %s → %s", result.get('name'), target_ip)
     emit_activity("dns.created", {"name": result.get("name"), "content": target_ip})
     return result
 
@@ -1830,7 +1836,7 @@ async def delete_dns(record_id: str):
     """Delete a DNS A record by its Cloudflare record ID."""
     _validate_cf_id(record_id, "record_id")
     await cf_request("DELETE", f"/zones/{config.cf_zone_id}/dns_records/{record_id}")
-    logger.info(f"Deleted DNS record: {record_id}")
+    logger.info("Deleted DNS record: %s", record_id)
     emit_activity("dns.deleted", {"record_id": record_id})
     return {"success": True}
 
@@ -1930,6 +1936,7 @@ async def scan():
         "services": services,
         "unmatched_dns": unmatched_dns,
         "passthrough_dns": passthrough_dns,
+        "domain": config.domain,
         "npm_host": config.npm_host,  # for frontend use in "Add DNS" action
         "uptime_kuma_url": config.uptime_kuma_url,
         "homepage_url": config.homepage_url,
@@ -1953,7 +1960,7 @@ async def _reconcile_loop() -> None:
                 try:
                     scan_data = await scan()
                 except Exception as e:
-                    logger.warning(f"reconcile scan failed: {e}")
+                    logger.warning("reconcile scan failed: %s", e)
                 else:
                     ud = len(scan_data.get("unmatched_dns") or [])
                     md = sum(
@@ -1983,11 +1990,11 @@ async def _reconcile_loop() -> None:
                                     },
                                 )
                         except Exception as e:
-                            logger.warning(f"reconcile webhook failed: {e}")
+                            logger.warning("reconcile webhook failed: %s", e)
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.warning(f"reconcile loop error: {e}")
+            logger.warning("reconcile loop error: %s", e)
         await asyncio.sleep(interval)
 
 
@@ -2138,7 +2145,7 @@ async def create_service(svc: ServiceCreate):
     dns_record_id = result.get("id")
     if not dns_record_id:
         raise HTTPException(status_code=502, detail="Cloudflare returned success but no record ID")
-    logger.info(f"DNS record created: {domain} → {config.npm_host} (id={dns_record_id})")
+    logger.info("DNS record created: %s → %s (id=%s)", domain, config.npm_host, dns_record_id)
 
     # Step 2 — NPM proxy host.  Roll back DNS on failure.
     advanced_config = "proxy_ssl_verify off;" if svc.ssl_verify_off else ""
@@ -2160,10 +2167,12 @@ async def create_service(svc: ServiceCreate):
     try:
         await npm_request("POST", "/api/nginx/proxy-hosts", json=npm_payload)
     except HTTPException:
-        logger.warning(f"NPM host creation failed for {domain}; rolling back DNS {dns_record_id}")
+        logger.warning(
+            "NPM host creation failed for %s; rolling back DNS %s", domain, dns_record_id
+        )
         try:
             await cf_request("DELETE", f"/zones/{config.cf_zone_id}/dns_records/{dns_record_id}")
-            logger.info(f"DNS rollback succeeded: {domain}")
+            logger.info("DNS rollback succeeded: %s", domain)
         except Exception as rollback_err:
             logger.error(
                 f"DNS rollback FAILED for {domain} (id={dns_record_id}): {rollback_err} "
@@ -2172,7 +2181,11 @@ async def create_service(svc: ServiceCreate):
         raise  # re-raise original NPM error to the frontend
 
     logger.info(
-        f"Service created: {domain} → {svc.forward_scheme}://{svc.forward_host}:{svc.forward_port}"
+        "Service created: %s → %s://%s:%s",
+        domain,
+        svc.forward_scheme,
+        svc.forward_host,
+        svc.forward_port,
     )
     emit_activity(
         "service.created",
@@ -2276,7 +2289,7 @@ async def delete_service(payload: ServiceDelete):
         if host_dict:
             restore_svc = _host_to_service_create(host_dict, payload.domain)
     except Exception as e:
-        logger.warning(f"Could not snapshot NPM host for trash/restore: {e}")
+        logger.warning("Could not snapshot NPM host for trash/restore: %s", e)
 
     # Step 1: delete proxy host
     await npm_request("DELETE", f"/api/nginx/proxy-hosts/{payload.proxy_host_id}")
@@ -2358,6 +2371,17 @@ _SAFE_NPM_PUT_KEYS: frozenset[str] = frozenset(
     }
 )
 
+_NPM_PUT_DEFAULTS: dict[str, Any] = {
+    "block_exploits": True,
+    "access_list_id": 0,
+    "meta": {},
+    "locations": [],
+    "http2_support": False,
+    "ssl_forced": True,
+    "allow_websocket_upgrade": False,
+    "advanced_config": "",
+}
+
 
 @app.post("/api/services/{proxy_host_id}/enabled", status_code=200)
 async def set_service_enabled(proxy_host_id: int, payload: ServiceEnabledUpdate):
@@ -2371,23 +2395,13 @@ async def set_service_enabled(proxy_host_id: int, payload: ServiceEnabledUpdate)
         raise HTTPException(status_code=404, detail="Proxy host not found")
 
     update_body: dict[str, Any] = {k: v for k, v in host.items() if k in _SAFE_NPM_PUT_KEYS}
-    _npm_put_defaults: dict[str, Any] = {
-        "block_exploits": True,
-        "access_list_id": 0,
-        "meta": {},
-        "locations": [],
-        "http2_support": False,
-        "ssl_forced": True,
-        "allow_websocket_upgrade": False,
-        "advanced_config": "",
-    }
-    for key, default in _npm_put_defaults.items():
+    for key, default in _NPM_PUT_DEFAULTS.items():
         if key in _SAFE_NPM_PUT_KEYS and key not in update_body:
             update_body[key] = default
     update_body["enabled"] = payload.enabled
 
     result = await npm_request("PUT", f"/api/nginx/proxy-hosts/{proxy_host_id}", json=update_body)
-    logger.info(f"Set proxy host {proxy_host_id} enabled={payload.enabled}")
+    logger.info("Set proxy host %s enabled=%s", proxy_host_id, payload.enabled)
     emit_activity(
         "service.proxy_enabled",
         {"proxy_host_id": proxy_host_id, "enabled": payload.enabled},
@@ -2425,37 +2439,42 @@ async def integrations_health():
     if _health_cache is not None and (now - _health_cache_mono) < _HEALTH_TTL_SEC:
         return _health_cache
 
+    async def _check_cf() -> dict[str, Any]:
+        t0 = time.perf_counter()
+        try:
+            await cf_request(
+                "GET", f"/zones/{config.cf_zone_id}/dns_records", params={"per_page": 1}
+            )
+            return {"ok": True, "latency_ms": int((time.perf_counter() - t0) * 1000)}
+        except HTTPException as e:
+            return {
+                "ok": False,
+                "latency_ms": int((time.perf_counter() - t0) * 1000),
+                "error": str(e.detail),
+            }
+        except Exception as e:
+            return {"ok": False, "latency_ms": None, "error": str(e)}
+
+    async def _check_npm() -> dict[str, Any]:
+        t1 = time.perf_counter()
+        try:
+            await npm_request("GET", "/api/nginx/settings")
+            return {"ok": True, "latency_ms": int((time.perf_counter() - t1) * 1000)}
+        except HTTPException as e:
+            return {
+                "ok": False,
+                "latency_ms": int((time.perf_counter() - t1) * 1000),
+                "error": str(e.detail),
+            }
+        except Exception as e:
+            return {"ok": False, "latency_ms": None, "error": str(e)}
+
+    cf_status, npm_status = await asyncio.gather(_check_cf(), _check_npm())
     out: dict[str, Any] = {
         "checked_at": datetime.now(UTC).isoformat(),
-        "cloudflare": {},
-        "npm": {},
+        "cloudflare": cf_status,
+        "npm": npm_status,
     }
-    t0 = time.perf_counter()
-    try:
-        await cf_request("GET", f"/zones/{config.cf_zone_id}/dns_records", params={"per_page": 1})
-        out["cloudflare"] = {"ok": True, "latency_ms": int((time.perf_counter() - t0) * 1000)}
-    except HTTPException as e:
-        out["cloudflare"] = {
-            "ok": False,
-            "latency_ms": int((time.perf_counter() - t0) * 1000),
-            "error": str(e.detail),
-        }
-    except Exception as e:
-        out["cloudflare"] = {"ok": False, "latency_ms": None, "error": str(e)}
-
-    t1 = time.perf_counter()
-    try:
-        # Lightweight settings read — confirms auth + API without listing all proxy hosts.
-        await npm_request("GET", "/api/nginx/settings")
-        out["npm"] = {"ok": True, "latency_ms": int((time.perf_counter() - t1) * 1000)}
-    except HTTPException as e:
-        out["npm"] = {
-            "ok": False,
-            "latency_ms": int((time.perf_counter() - t1) * 1000),
-            "error": str(e.detail),
-        }
-    except Exception as e:
-        out["npm"] = {"ok": False, "latency_ms": None, "error": str(e)}
 
     _health_cache = out
     _health_cache_mono = now

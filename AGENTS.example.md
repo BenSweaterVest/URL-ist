@@ -41,9 +41,15 @@ In Cursor, reference `@AGENTS.local.md` (or merge into a personal rule). The com
 
 `main.py`, `static/index.html`, `tests/`, `compose.yaml`, `README.md`, `tofu/`
 
+## Implementation notes (public repo)
+
+- `npm_cert_id < 1` → `is_configured()` is false (no silent default to 2).
+- Activity log trims **oldest** lines when over size cap.
+- Post-create checklist: Dockge, Homepage YAML copy, Kuma `/add`, wiki tiddler (Settings URLs).
+
 ## Agent tips
 
 1. Read `README.md` first.
 2. Never commit `config.json`, `.env`, `terraform.tfvars`, or real tokens.
-3. `GET /api/dns` → `{ records, truncated, npm_proxy_domains }`.
+3. `GET /api/dns` → `{ records, truncated, npm_proxy_domains }`; `GET /api/scan` includes `domain`.
 4. Only `git commit` when the user asks.

@@ -406,9 +406,41 @@ def test_batch_import_item_cap(configured_client: TestClient, csrf_headers: dict
     assert r.status_code == 422
 
 
-def test_invalid_npm_cert_id_not_configured(
-    client: TestClient, config_path: Path
+def test_auth_login_env_migration_preserves_integration_urls(
+    client: TestClient, config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("CONSOLE_PASSWORD", "bootstrappass12")
+    config_path.write_text(
+        json.dumps(
+            {
+                "cf_api_token": "cfat_test",
+                "cf_account_id": "a" * 32,
+                "cf_zone_id": "b" * 32,
+                "npm_url": "http://127.0.0.1:81",
+                "npm_email": "admin@example.com",
+                "npm_password": "npmsecret",
+                "npm_cert_id": 2,
+                "domain": "example.com",
+                "uptime_kuma_url": "https://uptime.example.com",
+                "homepage_url": "https://home.example.com",
+                "dockge_url": "https://dockge.example.com",
+                "wiki_url": "https://wiki.example.com",
+            }
+        ),
+        encoding="utf-8",
+    )
+    main_module._load_config()
+    r = client.post("/api/auth/login", json={"password": "bootstrappass12"})
+    assert r.status_code == 200, r.text
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved.get("dockge_url") == "https://dockge.example.com"
+    assert saved.get("wiki_url") == "https://wiki.example.com"
+    assert saved.get("uptime_kuma_url") == "https://uptime.example.com"
+    assert saved.get("homepage_url") == "https://home.example.com"
+    assert saved.get("console_password_hash", "").startswith("scrypt:")
+
+
+def test_invalid_npm_cert_id_not_configured(client: TestClient, config_path: Path) -> None:
     config_path.write_text(
         json.dumps(
             {

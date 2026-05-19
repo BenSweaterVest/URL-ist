@@ -159,13 +159,11 @@ Webhook JSON body: `{"event": "urler.reconcile", "unmatched_dns": <int>, "missin
 
 Reconcile events appear in the **Activity** tab only when drift is detected (non-zero counts).
 
-**Session signing:** `/api/health` and `/api/auth/status` include `session_secret_source` (`env`, `file`, or `runtime`). If you see `runtime` after saving settings, restart the container once so the session middleware loads the persisted key from `config.json`. The getting-started banner highlights this until you restart.
+**Session signing:** `/api/health` and `/api/auth/status` include `session_secret_source` (`env`, `file`, or `runtime`). Set **`SESSION_SECRET`** (≥16 characters) in `compose.yaml` for production, or let the wizard write `session_secret` to `config.json`. If you see `runtime` after saving settings, **restart once** so the session middleware loads the persisted key (the getting-started banner reminds you until then).
 
-**Integrations health:** The header CF/NPM pills use a lightweight probe (one DNS record + NPM settings read), not a full proxy-host listing.
+**NPM cert ID:** Must be **≥ 1** in Settings or `NPM_CERT_ID` env. A value of `0` marks the app as not fully configured and blocks service creation until corrected.
 
-**Session signing:** Set **`SESSION_SECRET`** (long random string, ≥16 characters) in `compose.yaml` so session cookies cannot be forged by anyone who can reach the container port. Optional `session_secret` in `config.json` is used as a fallback if `SESSION_SECRET` is not set.
-
-If you do not set `SESSION_SECRET`, the wizard will generate and persist a `session_secret` into `config.json`. **Restart once after setup** so the middleware loads that persisted key (otherwise sessions are signed with a per-process random key and will reset on restart).
+**Integrations health:** The header CF/NPM pills use a lightweight parallel probe (one DNS record + NPM settings read), not a full proxy-host listing.
 
 ---
 

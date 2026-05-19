@@ -1009,9 +1009,7 @@ function SettingsModal({ onClose, toast }) {
 
   if (!form) return (
     <div className="overlay">
-      <div className="modal" style={{textAlign:'center',padding:'40px',color:'var(--text-3)',fontFamily:'var(--mono)',fontSize:'12px'}}>
-        loading
-      </div>
+      <div className="modal"><div className="loading">loading</div></div>
     </div>
   );
 
@@ -1147,7 +1145,7 @@ function LinksPanel({ toast, onMutate }) {
   });
   const slugOk = !slug || validateSlug(slug);
   const targetOk = !target || targetUrlOk(target);
-  const nearQuota = items.length >= 18;
+  const nearQuota = items.length >= 450;
   const listTruncated = data?.truncated === true;
 
   return (
@@ -1211,8 +1209,8 @@ function LinksPanel({ toast, onMutate }) {
           )}
           {nearQuota && (
             <div className="quota-banner">
-              You have {items.length} short links. Many Cloudflare free accounts are limited to 20 list items;
-              if creation fails, contact Cloudflare support to raise your bulk redirect quota.
+              You have {items.length} short links. This UI loads up to 500 items per request; Cloudflare account
+              limits on bulk redirect list size vary by plan. If creation fails, check quotas in the Cloudflare dashboard.
             </div>
           )}
           {items.length === 0 ? (
@@ -1590,14 +1588,13 @@ function ServicesPanel({ toast, onMutate }) {
     if (soft) setRefreshing(true);
     else setLoading(true);
     try {
-      const [sc, tr, cfg] = await Promise.all([
+      const [sc, tr] = await Promise.all([
         api('GET', '/api/scan'),
         api('GET', '/api/trash').catch(() => ({ items: [] })),
-        api('GET', '/api/config'),
       ]);
       setScan(sc);
       setTrashItems(tr.items || []);
-      setBaseDomain(cfg.domain || '');
+      setBaseDomain(sc.domain || '');
     } catch (e) { toast(e.message, 'err'); }
     finally { setLoading(false); setRefreshing(false); }
   }, [toast]);
@@ -1692,7 +1689,7 @@ function ServicesPanel({ toast, onMutate }) {
     if (!ok) return;
     setRestoringId(entry.id);
     try {
-      await api('POST', `/api/trash/${entry.id}/restore`, {});
+      await api('POST', `/api/trash/${entry.id}/restore`, null);
       toast(`${entry.domain} restored`, 'ok');
       load(true); onMutate();
     } catch (e) { toast(e.message, 'err'); }
@@ -1996,7 +1993,7 @@ function ServicesPanel({ toast, onMutate }) {
               onChange={e => setBatchText(e.target.value)}
               style={{ width: '100%', minHeight: '180px', background: 'var(--bg)', border: '1px solid var(--border2)', color: 'var(--text)', borderRadius: 'var(--radius)', padding: '10px', fontFamily: 'var(--mono)', fontSize: '12px' }}
             />
-            <div className="field-hint">Each item uses the same fields as New Service: subdomain, forward_host, forward_port, forward_scheme, websocket, ssl_verify_off.</div>
+            <div className="field-hint">Each item uses the same fields as New Service: subdomain, forward_host, forward_port, forward_scheme, websocket, ssl_verify_off. Preview does not re-check conflicts if the list changes before you run import.</div>
           </div>
           <div className="field">
             <label className="check-row label-plain">
