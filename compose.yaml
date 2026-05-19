@@ -56,7 +56,8 @@ services:
     #   CF_LIST_NAME: "shortlinks"
     #   NPM_CERT_ID: "2"                  # wildcard cert ID in NPM (must be >= 1)
     #   CONSOLE_PASSWORD: ""              # optional bootstrap password before first wizard save
-    #   CONFIG_HISTORY_LIMIT: "100"       # config snapshots in /data/config-versions (0 = off)
+    #   CONFIG_HISTORY_LIMIT: "100"       # config snapshots to keep in /data/config-versions (0 = off)
+    #   CONFIG_HISTORY_DIR: "/data/config-versions"  # override snapshot directory path
     #   # Background reconcile (see README)
     #   RECONCILE_INTERVAL_SEC: "3600"
     #   RECONCILE_INITIAL_DELAY_SEC: "120"

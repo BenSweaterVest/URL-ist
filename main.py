@@ -405,6 +405,16 @@ def _npm_url_ssrf_guard(url: str) -> str:
     return url
 
 
+def _normalize_integration_url(url: str) -> str:
+    """Optional integration URLs: empty or http(s) only (blocks javascript: etc.)."""
+    v = (url or "").strip()
+    if not v:
+        return ""
+    if not v.startswith(("http://", "https://")):
+        raise ValueError("Integration URL must start with http:// or https://")
+    return v
+
+
 def _normalize_npm_url(url: str) -> str:
     v = url.rstrip("/")
     if not v:
@@ -1275,6 +1285,11 @@ class ConfigProposal(BaseModel):
             return v
         return _normalize_npm_url(v)
 
+    @field_validator("uptime_kuma_url", "homepage_url", "dockge_url", "wiki_url")
+    @classmethod
+    def validate_integration_urls(cls, v: str) -> str:
+        return _normalize_integration_url(v)
+
 
 class ConfigTestProposal(BaseModel):
     cf_api_token: str
@@ -1599,6 +1614,7 @@ class LinkCreate(BaseModel):
 
 class LinkUpdate(BaseModel):
     target: str
+    status_code: int | None = None
 
     @field_validator("target")
     @classmethod
@@ -1606,6 +1622,15 @@ class LinkUpdate(BaseModel):
         v = v.strip()
         if not v.startswith(("http://", "https://")):
             raise ValueError("Target must start with http:// or https://")
+        return v
+
+    @field_validator("status_code")
+    @classmethod
+    def validate_status_code(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        if v not in ALLOWED_REDIRECT_STATUS_CODES:
+            raise ValueError("status_code must be 301, 302, 307, or 308")
         return v
 
 
@@ -1681,7 +1706,11 @@ async def update_link(item_id: str, payload: LinkUpdate):
 
     source_url = str((existing.get("redirect") or {}).get("source_url", ""))
     old_target = str((existing.get("redirect") or {}).get("target_url", ""))
-    status_code = _redirect_status_from_item(existing)
+    status_code = (
+        payload.status_code
+        if payload.status_code is not None
+        else _redirect_status_from_item(existing)
+    )
     # Slug comes from the stored source URL path — do not depend on current
     # config.short_domain (it may have changed since the item was created).
     path = (urlparse(source_url).path or "").strip("/")
@@ -1740,6 +1769,11 @@ async def update_link(item_id: str, payload: LinkUpdate):
 # ── DNS Records ───────────────────────────────────────────────────────────────
 
 
+def _npm_host_domain_names(host: dict[str, Any]) -> list[str]:
+    """All domain names on an NPM proxy host (lowercased)."""
+    return [str(x).lower() for x in (host.get("domain_names") or []) if x]
+
+
 async def _npm_proxy_domain_names() -> set[str]:
     """Domain names with an NPM proxy host (for DNS delete guardrails)."""
     try:
@@ -1748,9 +1782,7 @@ async def _npm_proxy_domain_names() -> set[str]:
         return set()
     names: set[str] = set()
     for host in hosts:
-        domain = (host.get("domain_names") or [None])[0]
-        if domain:
-            names.add(str(domain).lower())
+        names.update(_npm_host_domain_names(host))
     return names
 
 
@@ -1909,10 +1941,11 @@ async def scan():
     npm_domains: set[str] = set()
     services: list[dict] = []
     for host in npm_hosts:
-        domain = (host.get("domain_names") or [None])[0]
-        if not domain:
+        host_domains = _npm_host_domain_names(host)
+        if not host_domains:
             continue
-        npm_domains.add(domain)
+        domain = host_domains[0]
+        npm_domains.update(host_domains)
         dns_record = dns_by_domain.get(domain)
         services.append(
             {
@@ -2175,8 +2208,10 @@ async def create_service(svc: ServiceCreate):
             logger.info("DNS rollback succeeded: %s", domain)
         except Exception as rollback_err:
             logger.error(
-                f"DNS rollback FAILED for {domain} (id={dns_record_id}): {rollback_err} "
-                "— manual cleanup required in Cloudflare dashboard"
+                "DNS rollback FAILED for %s (id=%s): %s — manual cleanup required in Cloudflare dashboard",
+                domain,
+                dns_record_id,
+                rollback_err,
             )
         raise  # re-raise original NPM error to the frontend
 
@@ -2214,7 +2249,9 @@ async def batch_services(payload: ServiceBatchRequest):
         npm_request("GET", "/api/nginx/proxy-hosts"),
     )
     existing_dns = {r.get("name") for r in dns_list}
-    existing_npm = {((h.get("domain_names") or [None])[0]) for h in npm_hosts}
+    existing_npm: set[str] = set()
+    for h in npm_hosts:
+        existing_npm.update(_npm_host_domain_names(h))
 
     plan: list[dict[str, Any]] = []
     for item in payload.items:
@@ -2316,8 +2353,10 @@ async def delete_service(payload: ServiceDelete):
         except HTTPException as e:
             dns_error = str(e.detail)
             logger.warning(
-                f"DNS delete failed after NPM delete: domain={payload.domain}, "
-                f"dns_record_id={dns_target_id}, detail={dns_error}"
+                "DNS delete failed after NPM delete: domain=%s, dns_record_id=%s, detail=%s",
+                payload.domain,
+                dns_target_id,
+                dns_error,
             )
 
     if restore_svc:
@@ -2331,8 +2370,11 @@ async def delete_service(payload: ServiceDelete):
         )
 
     logger.info(
-        f"Deleted service: domain={payload.domain}, proxy_host_id={payload.proxy_host_id}, "
-        f"npm_deleted={npm_deleted}, dns_deleted={dns_deleted}"
+        "Deleted service: domain=%s, proxy_host_id=%s, npm_deleted=%s, dns_deleted=%s",
+        payload.domain,
+        payload.proxy_host_id,
+        npm_deleted,
+        dns_deleted,
     )
     emit_activity(
         "service.deleted",

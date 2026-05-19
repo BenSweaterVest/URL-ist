@@ -191,7 +191,7 @@ Your home server is never contacted for short link redirects. The console only n
 
 **Availability**: Short links work even if your home server is offline.  
 **Latency**: Single-digit milliseconds from any location (Cloudflare edge node near the user, not your home upload speed).  
-**Cost**: Uses Cloudflare Bulk Redirects on the free plan (no Workers). Many free accounts are provisioned with **20 redirect list items** by default; if you hit a limit error after ~20 links, contact Cloudflare support to have your quota raised (often to 10,000). API errors from Cloudflare are shown in the UI with the message returned by Cloudflare.
+**Cost**: Uses Cloudflare Bulk Redirects on the free plan (no Workers). Redirect list capacity varies by plan — if you hit a quota error, check your account limits in the Cloudflare dashboard. API errors from Cloudflare are shown in the UI with the message returned by Cloudflare.
 
 ### Services tab
 
@@ -355,7 +355,7 @@ This repository is intended for public GitHub. **Never commit:**
 | `AGENTS.local.md`, `AGENTS.md`, `*.local.md` | Homelab hostnames, LAN IPs, personal domains |
 | `activity.jsonl`, `service-trash.json` | Runtime logs may include domains you manage |
 
-Use **`AGENTS.example.md`** → copy to **`AGENTS.local.md`** for Cursor/agent context with your real values (both filenames are gitignored).
+Use **`AGENTS.example.md`** → copy to **`AGENTS.local.md`** (or `AGENTS.md`) for Cursor/agent context with your real values. **`AGENTS.md`**, **`AGENTS.local.md`**, and **`*.local.md`** are gitignored — never commit homelab IPs or domains.
 
 Before pushing: `git status` and confirm no secrets or homelab-specific notes are staged. Test fixtures use fake tokens like `cfat_test` only.
 

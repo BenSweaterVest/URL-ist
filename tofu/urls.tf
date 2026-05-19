@@ -130,6 +130,10 @@ resource "cloudflare_record" "short_domain" {
   content = "192.0.2.1"
   proxied = true
   comment = "Short link domain — managed by console Tofu bootstrap. Do not edit manually."
+
+  lifecycle {
+    prevent_destroy = true
+  }
 }
 
 

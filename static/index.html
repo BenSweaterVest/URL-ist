@@ -275,6 +275,11 @@ function validatePort(p) {
   const n = Number(p);
   return Number.isFinite(n) && Number.isInteger(n) && n >= 1 && n <= 65535;
 }
+function safeHttpUrl(s) {
+  const v = (s || '').trim();
+  return (v.startsWith('http://') || v.startsWith('https://')) ? v : '';
+}
+
 function targetUrlOk(s) {
   const v = (s || '').trim();
   return v.startsWith('https://') || v.startsWith('http://');
@@ -304,7 +309,8 @@ function shortLinkUrl(shortDomain, slug) {
 }
 
 function trimUrlBase(u) {
-  return (u || '').trim().replace(/\/+$/, '');
+  const v = safeHttpUrl(u);
+  return v ? v.replace(/\/+$/, '') : '';
 }
 
 function integrationUrl(base, path) {
@@ -1045,6 +1051,7 @@ function LinksPanel({ toast, onMutate }) {
   const [showAdd, setShowAdd] = useState(false);
   const [editItem, setEditItem] = useState(null);
   const [editTarget, setEditTarget] = useState('');
+  const [editStatusCode, setEditStatusCode] = useState(302);
   const [slug, setSlug]       = useState('');
   const [target, setTarget]   = useState('');
   const [statusCode, setStatusCode] = useState(302);
@@ -1112,6 +1119,8 @@ function LinksPanel({ toast, onMutate }) {
     setEditError('');
     setEditItem({ id: item.id, slug: s });
     setEditTarget(item.redirect?.target_url || '');
+    const code = item.redirect?.status_code ?? 302;
+    setEditStatusCode(REDIRECT_STATUS_OPTIONS.includes(code) ? code : 302);
   };
 
   const saveEdit = async () => {
@@ -1123,12 +1132,12 @@ function LinksPanel({ toast, onMutate }) {
     }
     setSaving(true);
     try {
-      await api('PUT', `/api/links/${editItem.id}`, { target: editTarget });
+      await api('PUT', `/api/links/${editItem.id}`, { target: editTarget, status_code: editStatusCode });
       toast(
-        `/${editItem.slug} updated. Browsers that visited this link before may cache the old redirect for a while.`,
+        `/${editItem.slug} updated (${editStatusCode}). Browsers that visited this link before may cache the old redirect for a while.`,
         'ok',
       );
-      setEditItem(null); setEditTarget('');
+      setEditItem(null); setEditTarget(''); setEditStatusCode(302);
       load(true); onMutate();
     } catch (e) { setEditError(e.message); }
     finally { setSaving(false); }
@@ -1301,7 +1310,7 @@ function LinksPanel({ toast, onMutate }) {
       )}
 
       {editItem && (
-        <Modal title={`Edit /${editItem.slug}`} onClose={() => { setEditItem(null); setEditError(''); }}>
+        <Modal title={`Edit /${editItem.slug}`} onClose={() => { setEditItem(null); setEditError(''); setEditStatusCode(302); }}>
           <ModalError error={editError} onDismiss={() => setEditError('')} />
           <div className="field-hint" style={{ marginBottom: '12px' }}>
             Short URL: <span className="mono">{shortLinkUrl(shortDomain, editItem.slug)}</span>
@@ -1314,6 +1323,16 @@ function LinksPanel({ toast, onMutate }) {
               onKeyDown={e => e.key === 'Enter' && saveEdit()} />
             {editTarget && !targetUrlOk(editTarget) && <div className="field-err">Must start with https:// or http://</div>}
             <div className="field-hint">Must start with https:// or http://. Browsers may cache old redirects for repeat visitors.</div>
+          </div>
+          <div className="field">
+            <label>Redirect status</label>
+            <select value={editStatusCode} onChange={e => setEditStatusCode(Number(e.target.value))}
+              style={{ width: '100%', background: 'var(--bg)', border: '1px solid var(--border2)', color: 'var(--text)', borderRadius: 'var(--radius)', padding: '8px 10px', fontFamily: 'var(--mono)', fontSize: '12px' }}>
+              {REDIRECT_STATUS_OPTIONS.map(c => (
+                <option key={c} value={c}>{c}{c === 302 ? ' (recommended)' : ''}</option>
+              ))}
+            </select>
+            <div className="field-hint">{redirectStatusHint(editStatusCode)}</div>
           </div>
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={() => setEditItem(null)}>Cancel</button>

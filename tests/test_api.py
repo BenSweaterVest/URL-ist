@@ -249,6 +249,62 @@ def test_update_link_preserves_status_code_and_source_url(
     assert get_paths[0].endswith(f"/items/{_LINK_ITEM_ID}")
 
 
+def test_update_link_can_change_status_code(
+    links_ready: TestClient,
+    csrf_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recreated: dict = {}
+
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        if method == "GET" and f"/items/{_LINK_ITEM_ID}" in path:
+            return {
+                "result": {
+                    "id": _LINK_ITEM_ID,
+                    "redirect": {
+                        "source_url": "https://short.example.com/ha",
+                        "target_url": "https://old.example.com",
+                        "status_code": 302,
+                    },
+                },
+            }
+        if method == "DELETE" and "/items" in path:
+            return {"success": True}
+        if method == "POST" and "/items" in path:
+            recreated["body"] = kwargs.get("json")
+            return {"result": [{"id": "b" * 32}]}
+        return {"result": []}
+
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    r = links_ready.put(
+        f"/api/links/{_LINK_ITEM_ID}",
+        json={"target": "https://new.example.com", "status_code": 301},
+        headers=csrf_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert recreated["body"][0]["redirect"]["status_code"] == 301
+
+
+def test_save_config_rejects_invalid_integration_url(client: TestClient, config_path: Path) -> None:
+    body = {
+        "cf_api_token": "x",
+        "cf_account_id": "c" * 32,
+        "cf_zone_id": "d" * 32,
+        "npm_url": "http://127.0.0.1:81",
+        "npm_email": "a@b.com",
+        "npm_password": "p",
+        "npm_cert_id": 2,
+        "domain": "example.com",
+        "short_domain": "",
+        "cf_list_name": "shortlinks",
+        "console_password": "longenough12",
+        "console_password_confirm": "longenough12",
+        "dockge_url": "javascript:alert(1)",
+    }
+    r = client.post("/api/config", json=body)
+    assert r.status_code == 422
+
+
 def test_list_links_truncated_flag(
     configured_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -323,14 +379,14 @@ def test_list_dns_includes_npm_proxy_domains(
 
     async def fake_npm_request(method: str, path: str, **kwargs):  # noqa: ARG001
         assert path == "/api/nginx/proxy-hosts"
-        return [{"domain_names": ["app.example.com"]}]
+        return [{"domain_names": ["app.example.com", "app2.example.com"]}]
 
     monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
     monkeypatch.setattr(main_module, "npm_request", fake_npm_request)
     r = configured_client.get("/api/dns")
     assert r.status_code == 200
     data = r.json()
-    assert data["npm_proxy_domains"] == ["app.example.com"]
+    assert data["npm_proxy_domains"] == ["app.example.com", "app2.example.com"]
 
 
 def test_create_link_accepts_301(
