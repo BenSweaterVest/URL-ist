@@ -75,7 +75,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 logger = logging.getLogger("urler")
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 CF_BASE = "https://api.cloudflare.com/client/v4"
 MASK_CHAR = "•"  # used to mask secrets in GET /api/config responses

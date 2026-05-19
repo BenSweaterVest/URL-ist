@@ -409,6 +409,7 @@ def test_batch_import_item_cap(configured_client: TestClient, csrf_headers: dict
 def test_auth_login_env_migration_preserves_integration_urls(
     client: TestClient, config_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """CONSOLE_PASSWORD env + no hash: first login writes config.json and keeps integration URLs."""
     monkeypatch.setenv("CONSOLE_PASSWORD", "bootstrappass12")
     config_path.write_text(
         json.dumps(
@@ -430,14 +431,19 @@ def test_auth_login_env_migration_preserves_integration_urls(
         encoding="utf-8",
     )
     main_module._load_config()
+    assert not main_module.config.console_password_hash
+    assert main_module._console_password_env == "bootstrappass12"
+
     r = client.post("/api/auth/login", json={"password": "bootstrappass12"})
     assert r.status_code == 200, r.text
+
     saved = json.loads(config_path.read_text(encoding="utf-8"))
     assert saved.get("dockge_url") == "https://dockge.example.com"
     assert saved.get("wiki_url") == "https://wiki.example.com"
     assert saved.get("uptime_kuma_url") == "https://uptime.example.com"
     assert saved.get("homepage_url") == "https://home.example.com"
     assert saved.get("console_password_hash", "").startswith("scrypt:")
+    assert main_module._console_password_env is None
 
 
 def test_invalid_npm_cert_id_not_configured(client: TestClient, config_path: Path) -> None:
