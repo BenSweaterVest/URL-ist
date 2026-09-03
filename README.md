@@ -2,7 +2,7 @@
 
 A self-hosted management console for [Cloudflare](https://cloudflare.com) + [Nginx Proxy Manager](https://nginxproxymanager.com), built for homelab use.
 
-**Three panels, one app:**
+**Four panels, one app:**
 
 | Panel | What it does |
 |-------|-------------|
@@ -14,9 +14,9 @@ A self-hosted management console for [Cloudflare](https://cloudflare.com) + [Ngi
 ### What each panel does
 
 - **Short Links** — Add slugs (choose redirect status 301/302/307/308 on create; default 302), change destinations in place, delete entries. Preflight checks list + DNS readiness. Requires one-time Tofu bootstrap.
-- **DNS** — Manage A records (full zone list via API pagination; table pages locally when there are many rows). Warns before deleting the short-links domain record or any name that still has an NPM proxy host (use Services to remove both).
+- **DNS** — Manage A records (full zone list via API pagination; table pages locally when there are many rows). Warns before deleting the short-links domain record or any name that still has an NPM proxy host (use Services to remove both). If NPM cannot be reached the tab says so, because that second warning depends on NPM's host list.
 - **Services** — One form creates `subdomain.domain` DNS (→ NPM) and an NPM proxy host (→ your backend). Delete removes NPM host and DNS (with warnings on partial failure); recently deleted entries can be **restored** from a trash snapshot. Toggle enables/disables the NPM proxy without deleting DNS. **Batch Import** accepts a JSON array (`subdomain`, `forward_host`, `forward_port`, optional `forward_scheme`), dry-run preview, then apply (failures stay visible in the modal). After creating a service, a homelab checklist links to Dockge, Uptime Kuma (`/add`), Homepage (copy-paste `services.yaml` snippet), and TiddlyWiki when those URLs are set in Settings.
-- **Activity** — Append-only log of changes (stored as JSON lines under `/data/activity.jsonl`). When the log exceeds ~2 MB, **oldest** events are removed first (newest entries are kept). The **Settings → Test connections** panel and **`GET /api/integrations/health`** report Cloudflare/NPM reachability. The header also shows in-memory **`/api/metrics`** counters (API requests and reconcile runs since container start).
+- **Activity** — Append-only log of changes (stored as JSON lines under `/data/activity.jsonl`). When the log exceeds ~2 MB, **oldest** events are removed first (newest entries are kept) in a single pass, so trimming does not stall requests. The **Settings → Test connections** panel and **`GET /api/integrations/health`** report Cloudflare/NPM reachability. The header also shows in-memory **`/api/metrics`** counters (API requests and reconcile runs since container start).
 
 **Architecture:**
 ```
@@ -46,7 +46,7 @@ Management console:  urler.yourdomain.com
 ### 1. Deploy URLer
 
 ```bash
-git clone https://github.com/YOUR_USER/urler.git ~/stacks/urler && cd ~/stacks/urler
+git clone https://github.com/BenSweaterVest/URL-ist.git ~/stacks/urler && cd ~/stacks/urler
 
 # Optional but recommended: set a random SESSION_SECRET in compose.yaml
 # (e.g. openssl rand -hex 32) so login cookies are stable across restarts.
@@ -126,7 +126,8 @@ Settings are saved to `/data/config.json` inside the container (persisted via Do
 | **CF API Token** | Cloudflare API token | ✓ |
 | **CF Account ID** | Your Cloudflare account ID | ✓ |
 | **CF Zone ID** | Zone ID for your domain | ✓ |
-| **NPM URL** | Internal URL of your NPM instance, e.g. `http://192.168.1.1:81` | ✓ |
+| **NPM URL** | Internal URL of your NPM instance, e.g. `http://192.168.1.1:81`. Use an IP address unless you also set DNS Target IP. | ✓ |
+| **DNS Target IP** | IPv4 address that new service A records point to. Blank means "the host in NPM URL". Required when NPM URL uses a hostname, because Cloudflare only accepts an IP as A record content. | When NPM URL is a hostname |
 | **NPM Email** | NPM admin email | ✓ |
 | **NPM Password** | NPM admin password | ✓ |
 | **Base Domain** | Your domain, e.g. `example.com` — new services become `subdomain.example.com` | ✓ |
@@ -145,7 +146,11 @@ Settings are saved to `/data/config.json` inside the container (persisted via Do
 **URLer password:** Set in the wizard (stored as a salted hash in `config.json`). Minimum **12 characters**. Used only to unlock this web UI — it is **not** tied to your Ubuntu `sudo` password (the app runs in Docker and cannot safely verify OS logins). You may reuse the same passphrase if you want, but it is stored separately.
 
 **Skipping the wizard (env vars):**  
-Uncomment and populate the `environment:` section in `compose.yaml`. The app will start fully configured and skip the wizard. Set **`CONSOLE_PASSWORD`** there if you need a plaintext bootstrap password before the first save to `config.json` (on first successful login, a hash is written and the env-only path is no longer used).
+Uncomment and populate the `environment:` section in `compose.yaml`, including **`CONSOLE_PASSWORD`**. On the first successful login the app writes a hash of that password to `config.json` and stops reading the env var. If you leave `CONSOLE_PASSWORD` out, the app starts in setup mode: only the wizard endpoints respond, and the UI asks you to choose a password before anything else works. Nothing is exposed without a password.
+
+**Reopening the wizard:** if a required setting becomes invalid later (for example an NPM cert ID of `0`), the console shows the wizard again with your saved values filled in. Your console password is still required to get there, and secrets that come back masked are kept as they were unless you type new ones.
+
+**Hostnames and IDs are normalised on save.** Domains lose any scheme, path, trailing slash or dot and are lowercased. Cloudflare account and zone IDs must be 32 hex characters. Typing `https://short.example.com/` into Short Links Domain therefore works as intended.
 
 **Background reconcile (optional):** A periodic task compares NPM proxy hosts with Cloudflare DNS and logs drift. Tune with environment variables (see `compose.yaml` comments):
 
@@ -159,7 +164,7 @@ Webhook JSON body: `{"event": "urler.reconcile", "unmatched_dns": <int>, "missin
 
 Reconcile events appear in the **Activity** tab only when drift is detected (non-zero counts).
 
-**Session signing:** `/api/health` and `/api/auth/status` include `session_secret_source` (`env`, `file`, or `runtime`). Set **`SESSION_SECRET`** (≥16 characters) in `compose.yaml` for production, or let the wizard write `session_secret` to `config.json`. If you see `runtime` after saving settings, **restart once** so the session middleware loads the persisted key (the getting-started banner reminds you until then).
+**Session signing:** `/api/health` and `/api/auth/status` include `session_secret_source` (`env`, `file`, or `runtime`) and `session_secret_restart_needed`. The source describes the key the running process is actually using, not what is on disk. Set **`SESSION_SECRET`** (≥16 characters) in `compose.yaml` for production, or let the wizard write `session_secret` to `config.json`. After the first wizard save the process is still on its temporary key, so `session_secret_restart_needed` is `true` and the getting-started banner asks you to **restart once**. The flag clears after the restart.
 
 **NPM cert ID:** Must be **≥ 1** in Settings or `NPM_CERT_ID` env. A value of `0` marks the app as not fully configured and blocks service creation until corrected.
 
@@ -193,6 +198,10 @@ Your home server is never contacted for short link redirects. The console only n
 **Latency**: Single-digit milliseconds from any location (Cloudflare edge node near the user, not your home upload speed).  
 **Cost**: Uses Cloudflare Bulk Redirects on the free plan (no Workers). Redirect list capacity varies by plan — if you hit a quota error, check your account limits in the Cloudflare dashboard. API errors from Cloudflare are shown in the UI with the message returned by Cloudflare.
 
+**Writes are applied in the background by Cloudflare.** Adding, editing or deleting a list item returns an operation ID rather than the finished item. The console polls that operation for up to ten seconds before reporting success, which is how errors such as a duplicate slug reach the UI. If Cloudflare is slow the response carries `pending: true` and the UI shows a warning; refresh a moment later.
+
+**Items created elsewhere:** a list item with no explicit status code is treated by Cloudflare as a 301, and the console shows and preserves it as 301. Links created through the console always carry an explicit code.
+
 ### Services tab
 
 Creates two things in sequence, with automatic DNS rollback if NPM fails:
@@ -200,7 +209,9 @@ Creates two things in sequence, with automatic DNS rollback if NPM fails:
 1. A Cloudflare A record: `subdomain.yourdomain.com → your-npm-ip`
 2. An NPM proxy host: `subdomain.yourdomain.com → scheme://backend-host:port` with your wildcard SSL cert
 
-**Delete** removes the NPM proxy host and matching DNS record (warns if one step fails). **Enable/disable** toggles the NPM proxy without removing DNS. **Batch import** accepts JSON (`[{ "subdomain", "forward_host", "forward_port", ... }]`), supports dry-run preview, and optional continue-on-error.
+**Delete** removes the NPM proxy host and matching DNS record (warns if one step fails). **Enable/disable** calls NPM's own enable and disable endpoints, so no other setting on the proxy host is touched. **Batch import** accepts JSON (`[{ "subdomain", "forward_host", "forward_port", ... }]`), supports dry-run preview, and optional continue-on-error.
+
+Subdomains must be a single DNS label: 1 to 63 lowercase letters, digits or hyphens, not starting or ending with a hyphen.
 
 If NPM proxy host creation fails, the DNS record is automatically rolled back. If you need to retry a partially-failed service creation, delete any orphaned DNS record from the DNS tab first.
 
@@ -292,6 +303,7 @@ Configuration in `/data/config.json` is preserved across updates.
 
 ```
 ├── main.py                 FastAPI backend
+├── CHANGELOG.md            User-visible changes per version
 ├── requirements.txt        Python dependencies
 ├── requirements-dev.txt    pytest, ruff (local/CI)
 ├── tests/                  API tests (auth, CSRF, links, preflight)
@@ -308,7 +320,12 @@ Configuration in `/data/config.json` is preserved across updates.
     └── .gitignore          Excludes terraform.tfvars and state files
 ```
 
-**API auth:** After setup, most `/api/*` routes require a logged-in session and CSRF token on `POST`/`PUT`/`DELETE`. Exceptions include `/api/health`, `/api/config/status`, `/api/auth/*` (login/logout/status), and the first-time wizard (`GET`/`POST /api/config` before configuration).
+**API auth:** Two checks apply to `/api/*` routes other than `/api/health` and `/api/auth/*`:
+
+1. **Setup mode.** While a required setting is missing or no console password exists, only the wizard endpoints respond (`GET`/`POST /api/config`, `GET /api/config/status`, `POST /api/config/test`). Everything else returns 503.
+2. **Login.** As soon as a console password exists, every remaining route needs a logged-in session and a CSRF token on `POST`/`PUT`/`DELETE`. This applies inside setup mode too, so a half-configured install cannot be reconfigured by someone who does not know the password.
+
+Only a brand-new install with no password yet reaches the wizard without a session. Unknown `/api/*` paths return a JSON 404.
 
 ---
 
@@ -323,6 +340,8 @@ URLer manages your Cloudflare DNS and API credentials. Keep it internal.
 **HTTPS behind NPM**: When the browser only reaches the app over `https://`, set **`SESSION_COOKIE_HTTPS_ONLY=1`** in Compose so the session cookie is not sent on accidental `http://` hits.
 
 **Cookie settings**: By default the session cookie is **HttpOnly** (not accessible to JavaScript) and uses `SameSite=Lax`. You can set **`SESSION_COOKIE_SAMESITE=strict`** if you want stricter cross-site behavior.
+
+**Sign out does not revoke old cookies.** Sessions are signed cookies with no server-side record, so a cookie copied before sign-out stays valid until it expires (14 days). To invalidate every session at once, change `SESSION_SECRET` (or the `session_secret` in `config.json`) and restart.
 
 **CSRF protection**: All state-changing API requests require an `X-CSRF-Token` header (the SPA handles this automatically after login).
 

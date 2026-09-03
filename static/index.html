@@ -287,6 +287,10 @@ function targetUrlOk(s) {
 
 const DNS_PAGE_SIZE = 50;
 const REDIRECT_STATUS_OPTIONS = [302, 301, 307, 308];
+// Cloudflare treats a list item with no status_code as 301. Items created by
+// this app always carry an explicit code; this default only matters for items
+// added elsewhere (dashboard, Tofu).
+const CF_IMPLICIT_REDIRECT_STATUS = 301;
 
 function redirectStatusHint(code) {
   if (code === 301) {
@@ -306,6 +310,15 @@ function shortLinkUrl(shortDomain, slug) {
   const s = (slug || '').replace(/^\//, '');
   if (!host || !s) return '';
   return `https://${host}/${s}`;
+}
+
+function urlHostname(u) {
+  try { return new URL((u || '').trim()).hostname; } catch { return ''; }
+}
+
+function isIpv4(s) {
+  const parts = (s || '').trim().split('.');
+  return parts.length === 4 && parts.every(p => /^\d{1,3}$/.test(p) && Number(p) <= 255);
 }
 
 function trimUrlBase(u) {
@@ -354,6 +367,10 @@ function ServiceCreatedChecklist({ created, integrations, toast }) {
   const homepageYaml = homepageServicesYaml(domain);
   const kumaAdd = kuma ? integrationUrl(kuma, '/add') : '';
   const wikiNew = wiki ? `${wiki}/#New%20Tiddler` : '';
+  // Steps are numbered in display order; optional blocks that are hidden do
+  // not leave gaps.
+  let stepNo = 0;
+  const step = (title) => `${++stepNo}. ${title}`;
 
   return (
     <>
@@ -364,7 +381,7 @@ function ServiceCreatedChecklist({ created, integrations, toast }) {
 
       {dockge && (
         <div className="checklist-block">
-          <div className="checklist-block-title">1. Deploy stack (Dockge)</div>
+          <div className="checklist-block-title">{step('Deploy stack (Dockge)')}</div>
           <a href={dockge} target="_blank" rel="noreferrer" className="mono">Open Dockge</a>
           <div className="field-hint" style={{ marginTop: '6px' }}>
             Create or update the compose stack for <span className="mono">{domain}</span> pointing at your backend.
@@ -373,7 +390,7 @@ function ServiceCreatedChecklist({ created, integrations, toast }) {
       )}
 
       <div className="checklist-block">
-        <div className="checklist-block-title">{dockge ? '2' : '1'}. Uptime Kuma monitor</div>
+        <div className="checklist-block-title">{step('Uptime Kuma monitor')}</div>
         <span className="mono">{href}</span>
         {kumaAdd ? (
           <> — <a href={kumaAdd} target="_blank" rel="noreferrer">Add monitor</a></>
@@ -385,7 +402,7 @@ function ServiceCreatedChecklist({ created, integrations, toast }) {
       </div>
 
       <div className="checklist-block">
-        <div className="checklist-block-title">Homepage tile</div>
+        <div className="checklist-block-title">{step('Homepage tile')}</div>
         <pre className="snippet-pre">{homepageYaml}</pre>
         <div style={{ marginTop: '8px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
           <button type="button" className="btn btn-ghost btn-sm" onClick={() => copyToClipboard(homepageYaml, toast)}>
@@ -399,14 +416,14 @@ function ServiceCreatedChecklist({ created, integrations, toast }) {
 
       {wikiNew && (
         <div className="checklist-block">
-          <div className="checklist-block-title">TiddlyWiki</div>
+          <div className="checklist-block-title">{step('TiddlyWiki')}</div>
           <a href={wikiNew} target="_blank" rel="noreferrer">New tiddler</a>
           <div className="field-hint" style={{ marginTop: '6px' }}>Document the service on your wiki.</div>
         </div>
       )}
 
       <div className="checklist-block">
-        <div className="checklist-block-title">First-run app setup</div>
+        <div className="checklist-block-title">{step('First-run app setup')}</div>
         <div className="field-hint">Open the service URL, complete its wizard, and change default credentials.</div>
       </div>
     </>
@@ -436,11 +453,15 @@ function formatActivityEvent(ev) {
 
 // ── Toast notifications ───────────────────────────────────────────────────────
 
+let toastSeq = 0;
+
 function useToast() {
   const [toasts, setToasts] = useState([]);
   // add() is stable (no deps) so panels can safely use it in useCallback deps.
+  // A counter, not Date.now(): two toasts raised in the same millisecond would
+  // otherwise share a key and be dismissed together.
   const add = useCallback((msg, type = 'ok') => {
-    const id = Date.now();
+    const id = ++toastSeq;
     setToasts(t => [...t, { id, msg, type }]);
     setTimeout(() => setToasts(t => t.filter(x => x.id !== id)), 3500);
   }, []);
@@ -528,12 +549,14 @@ function ConfirmDialog({ title, message, confirmLabel, danger, requireText, onCo
   );
 }
 
-function GettingStartedBanner({ listExists, sessionSecretSource }) {
+function GettingStartedBanner({ listExists, restartNeeded }) {
   const [dismissed, setDismissed] = useState(() => {
     try { return localStorage.getItem(SETUP_BANNER_KEY) === '1'; } catch { return false; }
   });
   if (dismissed) return null;
-  const needsRestart = sessionSecretSource === 'runtime';
+  // restartNeeded comes from the backend: the process is still signing cookies
+  // with a temporary key even though a persistent one has been saved.
+  const needsRestart = !!restartNeeded;
   const dismiss = () => {
     try { localStorage.setItem(SETUP_BANNER_KEY, '1'); } catch { /* ignore */ }
     setDismissed(true);
@@ -630,7 +653,10 @@ function TestResults({ results }) {
 
 // ── Config form fields (shared by wizard and settings modal) ──────────────────
 
-function ConfigForm({ form, setField, consolePasswordOptional, toast }) {
+// consolePasswordOptional: a password already exists, so the fields may stay blank.
+// allowCertAutodetect: only the Settings modal, since the NPM lookup behind the
+// button needs a fully configured app and answers 503 in setup mode.
+function ConfigForm({ form, setField, consolePasswordOptional, allowCertAutodetect, toast }) {
   return (
     <>
       {/* Console login (wizard: required; settings: optional change) */}
@@ -690,6 +716,19 @@ function ConfigForm({ form, setField, consolePasswordOptional, toast }) {
             onChange={e => setField('npm_url', e.target.value)} />
           <div className="field-hint">Internal URL of your NPM instance (not the public URL)</div>
         </div>
+        <div className="field">
+          <label>DNS target IP</label>
+          <input type="text" placeholder={urlHostname(form.npm_url) || '192.168.1.1'} value={form.dns_target_ip || ''}
+            className={form.dns_target_ip && !isIpv4(form.dns_target_ip) ? 'input-invalid' : ''}
+            onChange={e => setField('dns_target_ip', e.target.value)} />
+          {form.dns_target_ip && !isIpv4(form.dns_target_ip) && <div className="field-err">Must be an IPv4 address</div>}
+          {!form.dns_target_ip && form.npm_url && !isIpv4(urlHostname(form.npm_url)) && (
+            <div className="field-err">The NPM URL uses a hostname, so this field is required</div>
+          )}
+          <div className="field-hint">
+            IPv4 address that new service A records point to. Leave blank to use the host from the NPM URL.
+          </div>
+        </div>
         <div className="grid2">
           <div className="field">
             <label>Email</label>
@@ -709,7 +748,7 @@ function ConfigForm({ form, setField, consolePasswordOptional, toast }) {
           <div className="field-hint">
             The certificate ID in NPM that covers *.yourdomain.com — find it in NPM → SSL Certificates → the cert ID shown in the URL when you click it
           </div>
-          {consolePasswordOptional && (
+          {allowCertAutodetect && (
           <div style={{ marginTop: '10px', display: 'flex', gap: '8px' }}>
             <button className="btn btn-ghost btn-sm" type="button" onClick={async () => {
               try {
@@ -844,7 +883,10 @@ function LoginScreen({ onAuthed, toast }) {
 
 
 // ── Setup Wizard ──────────────────────────────────────────────────────────────
-// Shown on first launch when no configuration exists.
+// Shown on first launch when no configuration exists, and again whenever a
+// required setting goes missing later (for example an invalid cert ID). In the
+// second case the form is prefilled from GET /api/config so nothing has to be
+// retyped; masked secrets are kept server-side when sent back unchanged.
 // Full-page (not a closeable modal) — the app is non-functional until configured.
 
 const WIZARD_DEFAULTS = {
@@ -853,23 +895,62 @@ const WIZARD_DEFAULTS = {
   npm_url: '', npm_email: '', npm_password: '',
   npm_cert_id: 2, domain: '',
   short_domain: '', cf_list_name: 'shortlinks',
+  dns_target_ip: '',
   uptime_kuma_url: '', homepage_url: '',
   dockge_url: '', wiki_url: '',
 };
 
-function WizardScreen({ onComplete, toast }) {
-  const [form, setForm]             = useState(WIZARD_DEFAULTS);
+const FIELD_LABELS = {
+  cf_api_token: 'Cloudflare API token', cf_account_id: 'Account ID', cf_zone_id: 'Zone ID',
+  npm_url: 'NPM URL', npm_email: 'NPM email', npm_password: 'NPM password',
+  npm_cert_id: 'Wildcard SSL cert ID', domain: 'Base domain', dns_target_ip: 'DNS target IP',
+};
+
+function WizardScreen({ onComplete, toast, status }) {
+  const [form, setForm]             = useState(null);
+  const [reopened, setReopened]     = useState(false);
   const [testResults, setTestResults] = useState(null);
   const [testing, setTesting]       = useState(false);
   const [saving, setSaving]         = useState(false);
 
   const setField = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const passwordSet = !!status?.console_password_set;
+  const missing = status?.missing_fields || [];
 
+  useEffect(() => {
+    // Prefill from whatever is already saved. On a brand-new install this
+    // returns empty strings, so the effect is harmless there.
+    api('GET', '/api/config').then(data => {
+      const next = { ...WIZARD_DEFAULTS };
+      for (const k of Object.keys(WIZARD_DEFAULTS)) {
+        if (k in data && data[k] !== null && data[k] !== undefined) next[k] = data[k];
+      }
+      next.console_password = '';
+      next.console_password_confirm = '';
+      // "Reopened" means something was saved before: show what is missing
+      // rather than the first-run greeting.
+      setReopened(!!(data.cf_account_id || data.domain || data.npm_url || data.console_password_set));
+      setForm(next);
+    }).catch(() => setForm({ ...WIZARD_DEFAULTS }));
+  }, []);
+
+  if (!form) return (
+    <div className="wizard-wrap"><div className="loading">loading</div></div>
+  );
+
+  const pw = form.console_password || '';
+  const passwordOk = passwordSet
+    ? (!pw || (pw.length >= 12 && pw === form.console_password_confirm))
+    : (pw.length >= 12 && pw === form.console_password_confirm);
+  const dnsTargetOk = form.dns_target_ip
+    ? isIpv4(form.dns_target_ip)
+    : isIpv4(urlHostname(form.npm_url));
   const requiredFilled = form.cf_api_token && form.cf_account_id && form.cf_zone_id
                       && form.npm_email && form.npm_password
                       && form.domain && form.npm_url
-                      && form.console_password && form.console_password.length >= 12
-                      && form.console_password === form.console_password_confirm;
+                      && Number(form.npm_cert_id) >= 1
+                      && dnsTargetOk
+                      && passwordOk;
 
   const test = async () => {
     setTesting(true);
@@ -888,14 +969,21 @@ function WizardScreen({ onComplete, toast }) {
     setSaving(true);
     try {
       await api('POST', '/api/config', form);
-      await api('POST', '/api/auth/login', { password: form.console_password });
+      if (form.console_password) {
+        // A new password was chosen (first run, or a change): start a session with it.
+        await api('POST', '/api/auth/login', { password: form.console_password });
+      }
+      let restartNeeded = false;
       try {
         const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
         const s = await r.json();
         CSRF_TOKEN = s.csrf_token || '';
+        restartNeeded = !!s.session_secret_restart_needed;
       } catch { /* ignore */ }
-      toast('Configuration saved — welcome to URLer!', 'ok');
-      toast('Tip: restart the container once to persist session signing across restarts.', 'ok');
+      toast(reopened ? 'Settings saved' : 'Configuration saved — welcome to URLer!', 'ok');
+      if (restartNeeded) {
+        toast('Tip: restart the container once so login sessions survive restarts.', 'ok');
+      }
       onComplete();
     } catch (e) {
       toast(e.message, 'err');
@@ -904,6 +992,12 @@ function WizardScreen({ onComplete, toast }) {
     }
   };
 
+  const subtitle = !passwordSet && status?.configured
+    ? 'Choose a console password to finish setup'
+    : reopened
+      ? 'Some required settings are missing. Fix them below to continue.'
+      : 'First-run setup — enter your credentials to get started';
+
   return (
     <div className="wizard-wrap">
       <div className="wizard">
@@ -911,11 +1005,17 @@ function WizardScreen({ onComplete, toast }) {
           <span className="wizard-brand-icon">🔗</span>
           <div>
             <div className="wizard-brand-title">URLER</div>
-            <div className="wizard-brand-sub">First-run setup — enter your credentials to get started</div>
+            <div className="wizard-brand-sub">{subtitle}</div>
           </div>
         </div>
 
-        <ConfigForm form={form} setField={setField} consolePasswordOptional={false} toast={toast} />
+        {reopened && missing.length > 0 && (
+          <div className="quota-banner">
+            Missing or invalid: {missing.map(k => FIELD_LABELS[k] || k).join(', ')}
+          </div>
+        )}
+
+        <ConfigForm form={form} setField={setField} consolePasswordOptional={passwordSet} toast={toast} />
 
         {/* Test results appear after clicking "Test Connections" */}
         <TestResults results={testResults} />
@@ -1023,7 +1123,7 @@ function SettingsModal({ onClose, toast }) {
     <Modal title="Settings" onClose={onClose} wide>
       <ModalError error={saveError} onDismiss={() => setSaveError('')} />
       <ModalError error={testError} onDismiss={() => setTestError('')} />
-      <ConfigForm form={form} setField={setField} consolePasswordOptional toast={toast} />
+      <ConfigForm form={form} setField={setField} consolePasswordOptional allowCertAutodetect toast={toast} />
       <TestResults results={testResults} />
       <div className="modal-footer">
         <button type="button" className="btn btn-ghost" onClick={exportBackup}>Export backup (JSON)</button>
@@ -1092,8 +1192,9 @@ function LinksPanel({ toast, onMutate }) {
     }
     setSaving(true);
     try {
-      await api('POST', '/api/links', { slug, target, status_code: statusCode });
+      const res = await api('POST', '/api/links', { slug, target, status_code: statusCode });
       toast(`/${slug} created (${statusCode})`, 'ok');
+      if (res.pending) toast('Cloudflare is still applying this change; refresh in a moment if it is missing.', 'warn');
       setShowAdd(false); setSlug(''); setTarget(''); setStatusCode(302); setAddError('');
       load(true); onMutate();
     } catch (e) { setAddError(e.message); }
@@ -1109,8 +1210,9 @@ function LinksPanel({ toast, onMutate }) {
     });
     if (!ok) return;
     try {
-      await api('DELETE', `/api/links/${id}`);
+      const res = await api('DELETE', `/api/links/${id}`);
       toast(`/${s} deleted`, 'ok');
+      if (res.pending) toast('Cloudflare is still applying this change; refresh in a moment if it still shows.', 'warn');
       load(true); onMutate();
     } catch (e) { toast(e.message, 'err'); }
   };
@@ -1119,8 +1221,8 @@ function LinksPanel({ toast, onMutate }) {
     setEditError('');
     setEditItem({ id: item.id, slug: s });
     setEditTarget(item.redirect?.target_url || '');
-    const code = item.redirect?.status_code ?? 302;
-    setEditStatusCode(REDIRECT_STATUS_OPTIONS.includes(code) ? code : 302);
+    const code = item.redirect?.status_code ?? CF_IMPLICIT_REDIRECT_STATUS;
+    setEditStatusCode(REDIRECT_STATUS_OPTIONS.includes(code) ? code : CF_IMPLICIT_REDIRECT_STATUS);
   };
 
   const saveEdit = async () => {
@@ -1132,11 +1234,12 @@ function LinksPanel({ toast, onMutate }) {
     }
     setSaving(true);
     try {
-      await api('PUT', `/api/links/${editItem.id}`, { target: editTarget, status_code: editStatusCode });
+      const res = await api('PUT', `/api/links/${editItem.id}`, { target: editTarget, status_code: editStatusCode });
       toast(
         `/${editItem.slug} updated (${editStatusCode}). Browsers that visited this link before may cache the old redirect for a while.`,
         'ok',
       );
+      if (res.pending) toast('Cloudflare is still applying this change; refresh in a moment if the old target still shows.', 'warn');
       setEditItem(null); setEditTarget(''); setEditStatusCode(302);
       load(true); onMutate();
     } catch (e) { setEditError(e.message); }
@@ -1218,8 +1321,8 @@ function LinksPanel({ toast, onMutate }) {
           )}
           {nearQuota && (
             <div className="quota-banner">
-              You have {items.length} short links. This UI loads up to 500 items per request; Cloudflare account
-              limits on bulk redirect list size vary by plan. If creation fails, check quotas in the Cloudflare dashboard.
+              You have {items.length} short links. Cloudflare limits on bulk redirect list size vary by plan;
+              if creation fails, check quotas in the Cloudflare dashboard.
             </div>
           )}
           {items.length === 0 ? (
@@ -1235,7 +1338,7 @@ function LinksPanel({ toast, onMutate }) {
                     const s = parseSlug(item.redirect?.source_url);
                     const t = item.redirect?.target_url;
                     const full = shortLinkUrl(shortDomain, s) || item.redirect?.source_url;
-                    const code = item.redirect?.status_code ?? 302;
+                    const code = item.redirect?.status_code ?? CF_IMPLICIT_REDIRECT_STATUS;
                     return (
                       <tr key={item.id}>
                         <td>
@@ -1382,6 +1485,7 @@ function DNSPanel({ toast, onMutate }) {
   const [dnsFilter, setDnsFilter] = useState('');
   const [dnsPage, setDnsPage] = useState(0);
   const [npmProxyDomains, setNpmProxyDomains] = useState(() => new Set());
+  const [npmGuardAvailable, setNpmGuardAvailable] = useState(true);
 
   const load = useCallback(async (soft) => {
     if (soft) setRefreshing(true);
@@ -1396,6 +1500,7 @@ function DNSPanel({ toast, onMutate }) {
       setShortDomain((cfg.short_domain || '').toLowerCase());
       setBaseDomain(cfg.domain || '');
       setNpmProxyDomains(new Set((dns.npm_proxy_domains || []).map(x => (x || '').toLowerCase())));
+      setNpmGuardAvailable(dns.npm_proxy_domains_available !== false);
     }
     catch (e) { toast(e.message, 'err'); }
     finally { setLoading(false); setRefreshing(false); }
@@ -1490,6 +1595,12 @@ function DNSPanel({ toast, onMutate }) {
       {dnsTruncated && (
         <div className="quota-banner">
           Not all DNS records could be loaded (pagination limit). Some A records may be missing from this list.
+        </div>
+      )}
+      {!npmGuardAvailable && (
+        <div className="quota-banner">
+          NPM could not be reached, so this page cannot tell which records still have a proxy host.
+          Deleting a record here will not warn you about an active service until NPM is back.
         </div>
       )}
 
@@ -1643,13 +1754,13 @@ function ServicesPanel({ toast, onMutate }) {
   };
 
   // Add missing DNS record for an existing NPM proxy host.
-  // Uses npm_host from the scan response so the IP is always consistent.
+  // Uses dns_target from the scan response so the IP is always consistent.
   const addDnsForService = async (domain) => {
-    const npmHost = scan?.npm_host;
+    const dnsTarget = scan?.dns_target;
     setFixingDns(domain);
     try {
-      await api('POST', '/api/dns', { name: domain, content: npmHost, proxied: false });
-      toast(`DNS added: ${domain} → ${npmHost}`, 'ok');
+      await api('POST', '/api/dns', { name: domain, content: dnsTarget, proxied: false });
+      toast(`DNS added: ${domain} → ${dnsTarget}`, 'ok');
       load(true); onMutate();
     } catch (e) { toast(e.message, 'err'); }
     finally { setFixingDns(null); }
@@ -2188,21 +2299,26 @@ function App() {
   const [counts, setCounts]         = useState({ links: null, dns: null, services: null });
   const [showSettings, setShowSettings] = useState(false);
   const [linksListExists, setLinksListExists] = useState(false);
-  const [sessionSecretSource, setSessionSecretSource] = useState('');
+  const [restartNeeded, setRestartNeeded] = useState(false);
+  const [authStatus, setAuthStatus] = useState(null);
   const { toasts, add: toast }      = useToast();
 
+  // Order matters: login comes before the wizard. A half-configured install that
+  // already has a password must not show the (prefilled) wizard to anyone who
+  // has not signed in.
   const boot = useCallback(async () => {
     try {
       const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
       const s = await r.json();
       CSRF_TOKEN = s.csrf_token || '';
-      setSessionSecretSource(s.session_secret_source || '');
-      if (!s.configured) {
-        setAppState('wizard');
-        return;
-      }
+      setAuthStatus(s);
+      setRestartNeeded(!!s.session_secret_restart_needed);
       if (s.login_required && !s.authenticated) {
         setAppState('login');
+        return;
+      }
+      if (!s.configured || !s.console_password_set) {
+        setAppState('wizard');
         return;
       }
       setAppState('ready');
@@ -2250,7 +2366,7 @@ function App() {
   // ── Wizard state ──
   if (appState === 'wizard') return (
     <>
-      <WizardScreen toast={toast} onComplete={() => { setAppState('ready'); }} />
+      <WizardScreen toast={toast} status={authStatus} onComplete={boot} />
       <ToastList toasts={toasts} />
     </>
   );
@@ -2258,7 +2374,7 @@ function App() {
   // ── Login gate ──
   if (appState === 'login') return (
     <>
-      <LoginScreen toast={toast} onAuthed={() => setAppState('ready')} />
+      <LoginScreen toast={toast} onAuthed={boot} />
       <ToastList toasts={toasts} />
     </>
   );
@@ -2302,7 +2418,7 @@ function App() {
         ))}
       </nav>
 
-      <GettingStartedBanner listExists={linksListExists} sessionSecretSource={sessionSecretSource} />
+      <GettingStartedBanner listExists={linksListExists} restartNeeded={restartNeeded} />
 
       <main className="main">
         {/* Each panel mounts on tab activation and unmounts on switch,

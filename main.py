@@ -30,11 +30,15 @@ Optional fields (env var names shown, built-in defaults listed):
   SHORT_DOMAIN    Full short-link domain  e.g. short.example.com  (default: "")
   CF_LIST_NAME    Cloudflare list name — must match Tofu bootstrap  (shortlinks)
   NPM_CERT_ID     Wildcard SSL cert ID in NPM                      (2)
+  DNS_TARGET_IP   IPv4 address service A records point to. Defaults to the host in
+                  NPM_URL; required when NPM_URL uses a hostname.
   CONFIG_FILE      Override path to config JSON           (/data/config.json)
   SESSION_SECRET   Key for signing login session cookies (>=16 chars). Optional if
                    session_secret is stored in config.json (auto-generated on first save).
   CONSOLE_PASSWORD Plaintext console password for env-only bootstrap; first login
-                   persists a hash to config.json (see README).
+                   persists a hash to config.json (see README). Without it (and with
+                   no hash in config.json) the console stays in setup mode and only
+                   the wizard endpoints respond until a password is chosen.
   SESSION_COOKIE_HTTPS_ONLY  If 1/true, session cookies are not sent over plain HTTP.
   SESSION_COOKIE_SAMESITE    Cookie SameSite: lax|strict|none  (default: lax)
   TRUST_PROXY_HEADERS        If 1/true, trust X-Forwarded-For for rate limiting (only behind a trusted proxy).
@@ -70,12 +74,12 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ValidationInfo, field_validator, model_validator
 from starlette.middleware.sessions import SessionMiddleware
 
 logger = logging.getLogger("urler")
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 CF_BASE = "https://api.cloudflare.com/client/v4"
 MASK_CHAR = "•"  # used to mask secrets in GET /api/config responses
@@ -129,6 +133,31 @@ def _write_config_snapshot(prior_path: Path) -> None:
         pass
 
 
+def _read_config_file() -> dict[str, Any]:
+    """Parse CONFIG_FILE, returning {} when it is missing or unreadable."""
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _persist_config(config_data: dict[str, Any]) -> None:
+    """Write config.json (keeping a snapshot of the old one) and reload in-memory state.
+
+    Shared by the wizard/settings save and by the CONSOLE_PASSWORD migration so
+    both paths rotate history and clear caches the same way.
+    """
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _write_config_snapshot(CONFIG_FILE)
+    CONFIG_FILE.write_text(json.dumps(config_data, indent=2))
+    CONFIG_FILE.chmod(0o600)  # credentials: owner read/write only
+    _load_config()
+    invalidate_integrations_health_cache()
+
+
 _request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
 _activity_lock = threading.Lock()
 _TRASH_LOCK = threading.Lock()
@@ -176,17 +205,24 @@ def _configure_urler_logging() -> None:
 
 
 def _trim_activity_log(path: Path) -> None:
-    """Drop oldest events until the log is under the trim target (preserves newest entries)."""
+    """Drop oldest events until the log is under the trim target (preserves newest entries).
+
+    Runs synchronously inside request handlers, so it has to be linear in the
+    file size. Sizes are measured once per line and the cut point is found by
+    walking from the newest entry backwards.
+    """
     if not path.exists():
         return
-    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    while lines:
-        body = "\n".join(lines) + "\n"
-        if len(body.encode("utf-8")) <= _ACTIVITY_TRIM_TARGET_BYTES:
-            path.write_text(body, encoding="utf-8")
-            return
-        lines.pop(0)
-    path.write_text("", encoding="utf-8")
+    lines = [ln for ln in path.read_bytes().splitlines() if ln.strip()]
+    kept: list[bytes] = []
+    total = 0
+    for ln in reversed(lines):
+        total += len(ln) + 1  # newline
+        if total > _ACTIVITY_TRIM_TARGET_BYTES:
+            break
+        kept.append(ln)
+    kept.reverse()
+    path.write_bytes(b"\n".join(kept) + (b"\n" if kept else b""))
 
 
 def emit_activity(action: str, detail: dict[str, Any] | None = None) -> None:
@@ -359,16 +395,37 @@ def _session_secret_sources() -> tuple[str, str]:
     return _RUNTIME_SESSION_SECRET, "runtime"
 
 
+# Captured once at import because SessionMiddleware reads its key when the app is
+# built and never again. Status endpoints report this value instead of re-reading
+# disk; otherwise they would claim "file" the moment the wizard persists a key
+# that the running middleware has never loaded.
+_ACTIVE_SESSION_SECRET, _ACTIVE_SESSION_SECRET_SOURCE = _session_secret_sources()
+
+
 def _session_secret() -> str:
-    """Secret for SessionMiddleware — env first, then optional key in config.json."""
-    secret, source = _session_secret_sources()
-    if source == "runtime":
+    """Secret for SessionMiddleware, resolved at import (env, then config.json, then runtime)."""
+    if _ACTIVE_SESSION_SECRET_SOURCE == "runtime":
         logger.warning(
             "SESSION_SECRET is not set (or too short) and no session_secret in config.json — "
             "using a per-process random session key (sessions will reset on restart). "
             "Complete the wizard to persist session_secret or set SESSION_SECRET."
         )
-    return secret
+    return _ACTIVE_SESSION_SECRET
+
+
+def _session_secret_status() -> dict[str, Any]:
+    """Describe the session key actually in use and whether a restart would change it.
+
+    session_secret_restart_needed is true when the process runs on a temporary key
+    but a persistent one now exists on disk or in the environment. The UI uses it
+    to keep the "restart once" reminder visible until the restart happens.
+    """
+    _, persisted = _session_secret_sources()
+    active = _ACTIVE_SESSION_SECRET_SOURCE
+    return {
+        "session_secret_source": active,
+        "session_secret_restart_needed": active == "runtime" and persisted != "runtime",
+    }
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -403,6 +460,59 @@ def _npm_url_ssrf_guard(url: str) -> str:
     if ip.is_link_local:
         raise ValueError("NPM URL cannot target cloud metadata addresses")
     return url
+
+
+def _is_ipv4(value: str) -> bool:
+    try:
+        ipaddress.IPv4Address((value or "").strip())
+    except ValueError:
+        return False
+    return True
+
+
+_CF_ID_RE = re.compile(r"^[a-f0-9]{32}$")
+_DNS_LABEL_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+def _normalize_hostname(value: str, label: str) -> str:
+    """Normalise a domain setting: lowercase, no scheme, no trailing slash or dot.
+
+    Users paste these from browser address bars, so "https://short.example.com/"
+    has to become "short.example.com" or every short link would be built as
+    "https://https://short.example.com//slug".
+    """
+    v = (value or "").strip().lower()
+    if not v:
+        return ""
+    v = re.sub(r"^https?://", "", v)
+    v = v.split("/", 1)[0].rstrip(".")
+    if not v:
+        raise ValueError(f"{label} is not a valid hostname")
+    for part in v.split("."):
+        if not _DNS_LABEL_RE.match(part):
+            raise ValueError(
+                f"{label} is not a valid hostname (labels are letters, digits and hyphens)"
+            )
+    return v
+
+
+def _normalize_cf_id(value: str, label: str) -> str:
+    """Cloudflare account and zone IDs are 32 lowercase hex characters."""
+    v = (value or "").strip().lower()
+    if not v:
+        return ""
+    if not _CF_ID_RE.match(v):
+        raise ValueError(f"{label} must be a 32-character hex string (copy it from the dashboard)")
+    return v
+
+
+def _normalize_ipv4(value: str, label: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        return ""
+    if not _is_ipv4(v):
+        raise ValueError(f"{label} must be an IPv4 address")
+    return v
 
 
 def _normalize_integration_url(url: str) -> str:
@@ -471,6 +581,15 @@ def _session_cookie_same_site() -> str:
 def _record_login_attempt(client_ip: str) -> None:
     """Raise 429 when too many login attempts from this IP in the sliding window."""
     now = time.monotonic()
+    # Forget addresses whose window has passed so the map does not grow with
+    # every client ever seen over the life of the process.
+    stale = [
+        ip
+        for ip, times in _login_attempts.items()
+        if not times or now - times[-1] >= _LOGIN_RATE_WINDOW_SEC
+    ]
+    for ip in stale:
+        del _login_attempts[ip]
     bucket = _login_attempts.setdefault(client_ip, [])
     bucket[:] = [t for t in bucket if now - t < _LOGIN_RATE_WINDOW_SEC]
     if len(bucket) >= _LOGIN_RATE_MAX:
@@ -521,11 +640,32 @@ def _require_csrf(request: Request) -> None:
         raise HTTPException(status_code=403, detail="CSRF token missing or invalid")
 
 
-def _login_required() -> bool:
-    """True when the console should require a successful /api/auth/login session."""
-    if not config.is_configured():
-        return False
+def _console_password_set() -> bool:
+    """True when a console password exists (stored hash or CONSOLE_PASSWORD env)."""
     return bool(config.console_password_hash or _console_password_env)
+
+
+def _login_required() -> bool:
+    """True when API calls need a logged-in session.
+
+    This depends only on whether a console password exists, not on whether the
+    rest of the configuration is complete. A half-configured install (for
+    example npm_cert_id set to 0) must still ask for the password before it
+    exposes the wizard endpoints, otherwise anyone on the network could read
+    the masked config and overwrite the password.
+    """
+    return _console_password_set()
+
+
+def _setup_complete() -> bool:
+    """True when the console can leave setup mode.
+
+    Setup mode is the state in which only the wizard endpoints respond. It ends
+    once every required field is present and a console password exists. An
+    env-only deployment that omits CONSOLE_PASSWORD therefore stays in setup
+    mode until a password is saved through the wizard.
+    """
+    return config.is_configured() and _console_password_set()
 
 
 def _session_authenticated(request: Request) -> bool:
@@ -552,6 +692,7 @@ class Config:
     short_domain: str = ""
     cf_list_name: str = "shortlinks"
     console_password_hash: str = ""
+    dns_target_ip: str = ""
     uptime_kuma_url: str = ""
     homepage_url: str = ""
     dockge_url: str = ""
@@ -560,8 +701,17 @@ class Config:
     # ── Derived properties ────────────────────────────────────────────────────
 
     @property
-    def npm_host(self) -> str:
-        """IP/hostname of NPM, parsed from npm_url.  Used for DNS cross-referencing."""
+    def dns_target(self) -> str:
+        """IPv4 address that service A records point to.
+
+        Defaults to the host part of npm_url, which fits the usual homelab layout
+        where NPM listens on a LAN IP. Set dns_target_ip when the NPM API is
+        reached through a hostname (Cloudflare only accepts an IP as A record
+        content) or when browsers should reach NPM at a different address than
+        this app uses for API calls.
+        """
+        if self.dns_target_ip:
+            return self.dns_target_ip
         return urlparse(self.npm_url).hostname or ""
 
     @property
@@ -575,7 +725,7 @@ class Config:
     # ── State helpers ─────────────────────────────────────────────────────────
 
     def is_configured(self) -> bool:
-        """True when all required fields are populated."""
+        """True when every required field is present and the DNS target is an IPv4 address."""
         return bool(
             self.cf_api_token
             and self.cf_account_id
@@ -585,6 +735,7 @@ class Config:
             and self.domain
             and self.npm_url
             and self.npm_cert_id >= 1
+            and _is_ipv4(self.dns_target)
         )
 
     def missing_fields(self) -> list[str]:
@@ -601,6 +752,9 @@ class Config:
         missing = [k for k, v in required.items() if not v]
         if self.npm_cert_id < 1:
             missing.append("npm_cert_id")
+        if self.npm_url and not _is_ipv4(self.dns_target):
+            # NPM URL uses a hostname and no explicit DNS target was given.
+            missing.append("dns_target_ip")
         return missing
 
 
@@ -693,6 +847,7 @@ def _load_config() -> None:
         short_domain=_get("short_domain", ""),
         cf_list_name=_get("cf_list_name", "shortlinks"),
         console_password_hash=_get("console_password_hash", ""),
+        dns_target_ip=_get("dns_target_ip", ""),
         uptime_kuma_url=_get("uptime_kuma_url", ""),
         homepage_url=_get("homepage_url", ""),
         dockge_url=_get("dockge_url", ""),
@@ -703,6 +858,28 @@ def _load_config() -> None:
         env_pw = os.environ.get("CONSOLE_PASSWORD", "").strip()
         if env_pw:
             _console_password_env = env_pw
+
+
+def _config_to_dict() -> dict[str, Any]:
+    """Serialisable copy of the in-memory config in config.json layout (secrets included)."""
+    return {
+        "cf_api_token": config.cf_api_token,
+        "cf_account_id": config.cf_account_id,
+        "cf_zone_id": config.cf_zone_id,
+        "npm_url": config.npm_url,
+        "npm_email": config.npm_email,
+        "npm_password": config.npm_password,
+        "npm_cert_id": config.npm_cert_id,
+        "domain": config.domain,
+        "short_domain": config.short_domain,
+        "cf_list_name": config.cf_list_name,
+        "console_password_hash": config.console_password_hash,
+        "dns_target_ip": config.dns_target_ip,
+        "uptime_kuma_url": config.uptime_kuma_url,
+        "homepage_url": config.homepage_url,
+        "dockge_url": config.dockge_url,
+        "wiki_url": config.wiki_url,
+    }
 
 
 def _mask(value: str) -> str:
@@ -753,6 +930,12 @@ async def lifespan(app: FastAPI):
         logger.info("  Short domain: %s", config.short_domain)
         logger.info("  CF list:      %s", config.cf_list_name)
         logger.info("  NPM:          %s", config.npm_url)
+        logger.info("  DNS target:   %s", config.dns_target)
+        if not _console_password_set():
+            logger.warning(
+                "  No console password. Set CONSOLE_PASSWORD or choose one in the setup "
+                "wizard; until then only the wizard endpoints respond."
+            )
         try:
             list_id = await get_list_id()
             if list_id:
@@ -786,14 +969,23 @@ app = FastAPI(title="URLer", lifespan=lifespan)
 
 @app.middleware("http")
 async def security_gate(request: Request, call_next):
-    """Enforce setup wizard gating and signed-cookie authentication for API calls.
+    """Enforce setup-mode gating and signed-cookie authentication for API calls.
 
     Non-API routes (SPA + /static) are always served.  /api/health stays open for
     Docker healthchecks.  /api/auth/* is open so the login page can call status/login.
 
-    Unconfigured installs: only /api/config* works (wizard).  After configuration,
-    /api/config* and all other functional APIs require a valid session unless no
-    console password is configured (legacy / migration only).
+    Two independent checks apply to everything else:
+
+    1. Setup mode.  While required settings are missing or no console password
+       exists, only the wizard endpoints respond (GET/POST /api/config,
+       GET /api/config/status, POST /api/config/test).  Everything else is 503.
+    2. Login.  Whenever a console password exists, every remaining route needs an
+       authenticated session plus a CSRF header on unsafe methods.  This applies
+       inside setup mode too, so a partially configured install cannot be taken
+       over by re-running the wizard.
+
+    A brand-new install has no password yet, so the wizard runs without a session.
+    CSRF is skipped in that case because there is no session to bind a token to.
     """
     path = request.url.path
 
@@ -803,16 +995,16 @@ async def security_gate(request: Request, call_next):
     if path == "/api/health" or path.startswith("/api/auth/"):
         return await call_next(request)
 
-    if not config.is_configured():
-        # Wizard-only routes — do not expose /api/config/export or other config/* helpers.
-        if path in ("/api/config", "/api/config/status"):
-            return await call_next(request)
-        if path == "/api/config/test" and request.method == "POST":
-            return await call_next(request)
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "Application not configured. Complete the setup wizard first."},
+    if not _setup_complete():
+        # Wizard-only routes. /api/config/export and other helpers stay closed.
+        is_wizard_route = path in ("/api/config", "/api/config/status") or (
+            path == "/api/config/test" and request.method == "POST"
         )
+        if not is_wizard_route:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Application not configured. Complete the setup wizard first."},
+            )
 
     if not _session_authenticated(request):
         return JSONResponse(
@@ -820,10 +1012,11 @@ async def security_gate(request: Request, call_next):
             content={"detail": "Not authenticated"},
         )
 
-    try:
-        _require_csrf(request)
-    except HTTPException as e:
-        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+    if _login_required():
+        try:
+            _require_csrf(request)
+        except HTTPException as e:
+            return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
 
     return await call_next(request)
 
@@ -972,6 +1165,58 @@ async def _cf_get_list_item(list_id: str, item_id: str) -> dict[str, Any]:
     return item
 
 
+_CF_LIST_OP_POLL_SEC = 0.5
+_CF_LIST_OP_TIMEOUT_SEC = 10.0
+
+
+async def _cf_wait_list_operation(data: Any, what: str) -> bool:
+    """Wait for an asynchronous list-item write to finish.
+
+    Cloudflare applies bulk list writes (add, delete, replace) in the background
+    and answers immediately with an operation_id. Errors such as a duplicate
+    source URL only appear in the operation status, so callers poll here before
+    telling the user the change is live.
+
+    Returns True when the operation completed and False when its outcome is
+    unknown: still pending at the timeout, or the status read itself failed. The
+    write was already accepted in both cases, so the caller reports the change as
+    pending rather than failed. Raises HTTPException only when Cloudflare says
+    the operation failed.
+    """
+    result = data.get("result") if isinstance(data, dict) else None
+    op_id = str(result.get("operation_id") or "") if isinstance(result, dict) else ""
+    if not op_id:
+        return True  # nothing to wait for (synchronous response shape)
+    path = f"/accounts/{config.cf_account_id}/rules/lists/bulk_operations/{op_id}"
+    deadline = time.monotonic() + _CF_LIST_OP_TIMEOUT_SEC
+    while True:
+        try:
+            status_data = await cf_request("GET", path)
+        except HTTPException as e:
+            logger.warning(
+                "Could not read Cloudflare list operation %s (%s): %s", op_id, what, e.detail
+            )
+            return False
+        op = status_data.get("result") or {}
+        status = str(op.get("status") or "").lower()
+        if status == "completed":
+            return True
+        if status == "failed":
+            msg = str(op.get("error") or "operation failed")
+            logger.error("Cloudflare list operation %s (%s) failed: %s", op_id, what, msg)
+            raise HTTPException(status_code=502, detail=f"Cloudflare: {msg}")
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Cloudflare list operation %s (%s) still %s after %.0fs",
+                op_id,
+                what,
+                status or "pending",
+                _CF_LIST_OP_TIMEOUT_SEC,
+            )
+            return False
+        await asyncio.sleep(_CF_LIST_OP_POLL_SEC)
+
+
 async def get_list_id() -> str | None:
     """Resolve the Cloudflare redirect list ID by name, with in-process caching.
 
@@ -1063,8 +1308,6 @@ async def npm_request(method: str, path: str, **kwargs) -> Any:
 
 # ── Input validation helpers ───────────────────────────────────────────────────
 
-_CF_ID_RE = re.compile(r"^[a-f0-9]{32}$")
-
 
 def _validate_cf_id(id_value: str, label: str) -> None:
     """Reject Cloudflare record/item IDs that are not hex strings.
@@ -1090,13 +1333,12 @@ async def health():
     Always returns 200 — even when unconfigured — so the container is considered
     healthy while the setup wizard is being completed.
     """
-    _, session_source = _session_secret_sources()
     return {
         "status": "ok",
         "service": "console",
         "version": __version__,
         "configured": config.is_configured(),
-        "session_secret_source": session_source,
+        **_session_secret_status(),
     }
 
 
@@ -1109,23 +1351,35 @@ class LoginBody(BaseModel):
 
 @app.get("/api/auth/status")
 async def auth_status(request: Request):
-    """Return bootstrap and login state for the SPA (no authentication required)."""
-    _, session_source = _session_secret_sources()
+    """Return bootstrap and login state for the SPA (no authentication required).
+
+    The SPA decides what to show from these flags: login first whenever
+    login_required is true and the session is not authenticated, then the wizard
+    when configured is false or console_password_set is false, otherwise the app.
+    """
     return {
         "configured": config.is_configured(),
+        "console_password_set": _console_password_set(),
         "missing_fields": config.missing_fields(),
         "authenticated": bool(request.session.get("authenticated")),
         "login_required": _login_required(),
         "csrf_token": _csrf_token(request) if request.session.get("authenticated") else "",
-        "session_secret_source": session_source,
+        **_session_secret_status(),
     }
 
 
 @app.post("/api/auth/login")
 async def auth_login(request: Request, body: LoginBody):
-    """Validate the console password and start a signed session."""
-    if not config.is_configured():
-        raise HTTPException(status_code=400, detail="Application is not configured yet")
+    """Validate the console password and start a signed session.
+
+    Login works as soon as a password exists, even when other settings are still
+    missing, so the wizard can be reopened safely on a half-configured install.
+    """
+    if not _console_password_set():
+        raise HTTPException(
+            status_code=503,
+            detail="No console password is configured — complete the setup wizard",
+        )
 
     client_ip = _client_ip(request)
     _record_login_attempt(client_ip)
@@ -1135,47 +1389,17 @@ async def auth_login(request: Request, body: LoginBody):
 
     if config.console_password_hash:
         ok = _verify_console_password(body.password, config.console_password_hash)
-    elif _console_password_env is not None:
-        ok = secrets.compare_digest(body.password, _console_password_env)
-        if ok:
-            new_hash = _hash_console_password(body.password)
-            snapshot: dict[str, Any] = {
-                "cf_api_token": config.cf_api_token,
-                "cf_account_id": config.cf_account_id,
-                "cf_zone_id": config.cf_zone_id,
-                "npm_url": config.npm_url,
-                "npm_email": config.npm_email,
-                "npm_password": config.npm_password,
-                "npm_cert_id": config.npm_cert_id,
-                "domain": config.domain,
-                "short_domain": config.short_domain,
-                "cf_list_name": config.cf_list_name,
-                "uptime_kuma_url": config.uptime_kuma_url,
-                "homepage_url": config.homepage_url,
-                "dockge_url": config.dockge_url,
-                "wiki_url": config.wiki_url,
-                "console_password_hash": new_hash,
-            }
-            prior_snap: dict[str, Any] = {}
-            if CONFIG_FILE.exists():
-                try:
-                    prior_snap = json.loads(CONFIG_FILE.read_text())
-                    ss = str(prior_snap.get("session_secret", "")).strip()
-                    if len(ss) >= 16:
-                        snapshot["session_secret"] = ss
-                except (OSError, json.JSONDecodeError, TypeError):
-                    prior_snap = {}
-            _ensure_session_secret_in_config(snapshot, prior_snap)
-            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CONFIG_FILE.write_text(json.dumps(snapshot, indent=2))
-            CONFIG_FILE.chmod(0o600)
-            _console_password_env = None
-            _load_config()
     else:
-        raise HTTPException(
-            status_code=503,
-            detail="No console password is configured — complete the setup wizard",
-        )
+        # CONSOLE_PASSWORD env bootstrap: first successful login stores a hash so the
+        # plaintext env var is no longer consulted.
+        ok = secrets.compare_digest(body.password, _console_password_env or "")
+        if ok:
+            snapshot = _config_to_dict()
+            snapshot["console_password_hash"] = _hash_console_password(body.password)
+            prior_snap = _read_config_file()
+            _ensure_session_secret_in_config(snapshot, prior_snap)
+            _persist_config(snapshot)
+            _console_password_env = None
 
     if not ok:
         raise HTTPException(status_code=401, detail="Invalid password")
@@ -1217,8 +1441,8 @@ async def get_config():
     are replaced with a masked representation (first+last 4 chars visible).
     To change a sensitive field, clear it and enter the new value; the server
     detects unchanged masked values via _resolve() and keeps the existing credential.
-    Accessible without auth only during first-run setup; once configured it
-    requires an authenticated session.
+    Reachable without a session only while no console password exists (first
+    run). Once a password is set it needs a login, even in setup mode.
     """
     return {
         "configured": config.is_configured(),
@@ -1233,7 +1457,9 @@ async def get_config():
         "domain": config.domain,
         "short_domain": config.short_domain,
         "cf_list_name": config.cf_list_name,
-        "console_password_set": bool(config.console_password_hash or _console_password_env),
+        "console_password_set": _console_password_set(),
+        "dns_target_ip": config.dns_target_ip,
+        "dns_target": config.dns_target,
         "uptime_kuma_url": config.uptime_kuma_url,
         "homepage_url": config.homepage_url,
         "dockge_url": config.dockge_url,
@@ -1266,6 +1492,7 @@ class ConfigProposal(BaseModel):
     cf_list_name: str = "shortlinks"
     console_password: str = ""
     console_password_confirm: str = ""
+    dns_target_ip: str = ""
     uptime_kuma_url: str = ""
     homepage_url: str = ""
     dockge_url: str = ""
@@ -1285,10 +1512,38 @@ class ConfigProposal(BaseModel):
             return v
         return _normalize_npm_url(v)
 
+    @field_validator("cf_account_id", "cf_zone_id")
+    @classmethod
+    def validate_cf_ids(cls, v: str, info: ValidationInfo) -> str:
+        return _normalize_cf_id(v, str(info.field_name))
+
+    @field_validator("domain", "short_domain")
+    @classmethod
+    def validate_domains(cls, v: str, info: ValidationInfo) -> str:
+        label = "Base domain" if info.field_name == "domain" else "Short links domain"
+        return _normalize_hostname(v, label)
+
+    @field_validator("dns_target_ip")
+    @classmethod
+    def validate_dns_target_ip(cls, v: str) -> str:
+        return _normalize_ipv4(v, "DNS target IP")
+
     @field_validator("uptime_kuma_url", "homepage_url", "dockge_url", "wiki_url")
     @classmethod
     def validate_integration_urls(cls, v: str) -> str:
         return _normalize_integration_url(v)
+
+    @model_validator(mode="after")
+    def validate_dns_target_resolvable(self) -> "ConfigProposal":
+        """Service A records need an IPv4 address; a hostname in NPM URL alone is not enough."""
+        if self.npm_url and not self.dns_target_ip:
+            host = urlparse(self.npm_url).hostname or ""
+            if not _is_ipv4(host):
+                raise ValueError(
+                    "NPM URL uses a hostname. Set DNS target IP to the IPv4 address that "
+                    "service A records should point to."
+                )
+        return self
 
 
 class ConfigTestProposal(BaseModel):
@@ -1317,6 +1572,17 @@ class ConfigTestProposal(BaseModel):
             return v
         return _normalize_npm_url(v)
 
+    @field_validator("cf_account_id", "cf_zone_id")
+    @classmethod
+    def validate_cf_ids(cls, v: str, info: ValidationInfo) -> str:
+        return _normalize_cf_id(v, str(info.field_name))
+
+    @field_validator("domain", "short_domain")
+    @classmethod
+    def validate_domains(cls, v: str, info: ValidationInfo) -> str:
+        label = "Base domain" if info.field_name == "domain" else "Short links domain"
+        return _normalize_hostname(v, label)
+
 
 @app.post("/api/config/test")
 async def test_config(proposal: ConfigTestProposal):
@@ -1324,8 +1590,8 @@ async def test_config(proposal: ConfigTestProposal):
 
     Performs a live check against both services without saving anything.
     Returns per-service results so the wizard can give specific feedback.
-    Unauthenticated only before first-time setup (/api/config* while unconfigured);
-    after configuration, requires an authenticated session like other /api/config routes.
+    Reachable without a session only while no console password exists; after
+    that it needs a login like the other /api/config routes.
     """
     # Resolve masked fields against current config.  When called from the settings
     # modal, the form contains masked display values from GET /api/config.
@@ -1397,14 +1663,9 @@ async def save_config(proposal: ConfigProposal):
     character (MASK_CHAR), it is treated as 'unchanged' and the existing value
     is preserved.  This handles the case where the settings form is submitted
     without the user modifying a pre-filled masked field.
-    Always accessible regardless of configuration state.
+    Reachable in setup mode and after it, subject to the login rule in security_gate.
     """
-    prior: dict[str, Any] = {}
-    if CONFIG_FILE.exists():
-        try:
-            prior = json.loads(CONFIG_FILE.read_text())
-        except (OSError, json.JSONDecodeError, TypeError):
-            prior = {}
+    prior = _read_config_file()
 
     prev_hash = str(prior.get("console_password_hash", "")).strip()
     new_pw = proposal.console_password.strip()
@@ -1438,6 +1699,7 @@ async def save_config(proposal: ConfigProposal):
         "short_domain": proposal.short_domain,
         "cf_list_name": proposal.cf_list_name,
         "console_password_hash": final_hash,
+        "dns_target_ip": proposal.dns_target_ip,
         "uptime_kuma_url": proposal.uptime_kuma_url.strip(),
         "homepage_url": proposal.homepage_url.strip(),
         "dockge_url": proposal.dockge_url.strip(),
@@ -1451,11 +1713,8 @@ async def save_config(proposal: ConfigProposal):
         if len(ss) >= 16:
             config_data["session_secret"] = ss
 
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
-        _write_config_snapshot(CONFIG_FILE)
-        CONFIG_FILE.write_text(json.dumps(config_data, indent=2))
-        CONFIG_FILE.chmod(0o600)  # credentials — owner read/write only
+        _persist_config(config_data)
     except OSError as e:
         raise HTTPException(
             500,
@@ -1463,8 +1722,6 @@ async def save_config(proposal: ConfigProposal):
             "Ensure the /data volume is mounted (see compose.yaml).",
         ) from None
 
-    _load_config()
-    invalidate_integrations_health_cache()
     logger.info("Configuration saved and reloaded")
     emit_activity("config.updated", {"configured": config.is_configured()})
     return {"success": True, "configured": config.is_configured()}
@@ -1569,16 +1826,24 @@ async def short_links_preflight():
 
 
 ALLOWED_REDIRECT_STATUS_CODES = frozenset({301, 302, 307, 308})
-DEFAULT_REDIRECT_STATUS_CODE = 302
+DEFAULT_REDIRECT_STATUS_CODE = 302  # what this app uses for new links
+CF_IMPLICIT_REDIRECT_STATUS_CODE = 301  # what Cloudflare uses when an item has no status_code
 
 
 def _redirect_status_from_item(item: dict[str, Any]) -> int:
-    """Return a valid redirect status from a CF list item, defaulting to 302."""
+    """Return the effective redirect status of a CF list item.
+
+    Items created outside this app may omit status_code entirely, and Cloudflare
+    treats those as 301. Reading them as 302 would silently change an item's
+    behaviour on the next edit, so the Cloudflare default applies here.
+    """
     try:
-        code = int((item.get("redirect") or {}).get("status_code", DEFAULT_REDIRECT_STATUS_CODE))
+        code = int(
+            (item.get("redirect") or {}).get("status_code", CF_IMPLICIT_REDIRECT_STATUS_CODE)
+        )
     except (TypeError, ValueError):
-        return DEFAULT_REDIRECT_STATUS_CODE
-    return code if code in ALLOWED_REDIRECT_STATUS_CODES else DEFAULT_REDIRECT_STATUS_CODE
+        return CF_IMPLICIT_REDIRECT_STATUS_CODE
+    return code if code in ALLOWED_REDIRECT_STATUS_CODES else CF_IMPLICIT_REDIRECT_STATUS_CODE
 
 
 class LinkCreate(BaseModel):
@@ -1642,7 +1907,9 @@ async def create_link(link: LinkCreate):
     destination remain visible after a slug has been visited. Pass status_code for 301/307/308.
 
     The full source URL is constructed server-side; the frontend only deals in slugs.
-    Requires short_domain to be configured (set in settings).
+    Requires short_domain to be configured (set in settings). The response carries
+    ``pending: true`` when Cloudflare had not finished applying the write within
+    the polling window.
     """
     if not config.short_domain:
         raise HTTPException(
@@ -1666,9 +1933,15 @@ async def create_link(link: LinkCreate):
             }
         ],
     )
+    completed = await _cf_wait_list_operation(data, f"create /{link.slug}")
     logger.info("Created short link: %s → %s", source_url, link.target)
     emit_activity("link.created", {"slug": link.slug, "source_url": source_url})
-    return data
+    return {
+        "success": True,
+        "slug": link.slug,
+        "source_url": source_url,
+        "pending": not completed,
+    }
 
 
 @app.delete("/api/links/{item_id}", status_code=200)
@@ -1678,22 +1951,25 @@ async def delete_link(item_id: str):
     list_id = await get_list_id()
     if not list_id:
         raise HTTPException(404, "Shortlink list not found")
-    await cf_request(
+    data = await cf_request(
         "DELETE",
         f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
         json={"items": [{"id": item_id}]},
     )
+    completed = await _cf_wait_list_operation(data, f"delete {item_id}")
     logger.info("Deleted short link: %s", item_id)
     emit_activity("link.deleted", {"item_id": item_id})
-    return {"success": True}
+    return {"success": True, "pending": not completed}
 
 
 @app.put("/api/links/{item_id}", status_code=200)
 async def update_link(item_id: str, payload: LinkUpdate):
     """Update target URL for an existing short link item.
 
-    Uses a safe replace flow (delete old item, recreate with same slug/new target).
-    If recreate fails, attempts to restore the original mapping.
+    Cloudflare has no in-place edit for list items, so this deletes the old item
+    and recreates it with the same source URL. Each write is awaited before the
+    next so the two cannot race; if the recreate fails the original mapping is
+    restored on a best-effort basis.
     """
     _validate_cf_id(item_id, "item_id")
     if not config.short_domain:
@@ -1718,18 +1994,18 @@ async def update_link(item_id: str, payload: LinkUpdate):
     if not slug:
         raise HTTPException(status_code=400, detail="Could not resolve slug from source_url")
 
-    # Step 1: remove old mapping
-    await cf_request(
-        "DELETE",
-        f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
-        json={"items": [{"id": item_id}]},
-    )
+    items_path = f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items"
+
+    # Step 1: remove old mapping and wait for it to land. A failed delete leaves
+    # the item untouched, so there is nothing to restore in that case.
+    del_data = await cf_request("DELETE", items_path, json={"items": [{"id": item_id}]})
+    await _cf_wait_list_operation(del_data, f"update /{slug} (delete)")
 
     try:
         # Step 2: create updated mapping
-        await cf_request(
+        add_data = await cf_request(
             "POST",
-            f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
+            items_path,
             json=[
                 {
                     "redirect": {
@@ -1740,15 +2016,16 @@ async def update_link(item_id: str, payload: LinkUpdate):
                 }
             ],
         )
+        completed = await _cf_wait_list_operation(add_data, f"update /{slug} (create)")
         logger.info("Updated short link: /%s → %s", slug, payload.target)
         emit_activity("link.updated", {"slug": slug, "item_id": item_id})
-        return {"success": True, "slug": slug}
+        return {"success": True, "slug": slug, "pending": not completed}
     except HTTPException:
         # Best-effort restore to previous target
         try:
-            await cf_request(
+            restore_data = await cf_request(
                 "POST",
-                f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
+                items_path,
                 json=[
                     {
                         "redirect": {
@@ -1759,6 +2036,7 @@ async def update_link(item_id: str, payload: LinkUpdate):
                     }
                 ],
             )
+            await _cf_wait_list_operation(restore_data, f"update /{slug} (restore)")
         except Exception as restore_err:
             logger.error(
                 "Failed to restore short link /%s after update error: %s", slug, restore_err
@@ -1774,16 +2052,21 @@ def _npm_host_domain_names(host: dict[str, Any]) -> list[str]:
     return [str(x).lower() for x in (host.get("domain_names") or []) if x]
 
 
-async def _npm_proxy_domain_names() -> set[str]:
-    """Domain names with an NPM proxy host (for DNS delete guardrails)."""
+async def _npm_proxy_domain_names() -> tuple[set[str], bool]:
+    """Domain names with an NPM proxy host, plus whether NPM answered.
+
+    Feeds the DNS delete guardrail. When NPM is unreachable the guardrail cannot
+    work, and the caller passes that on to the UI rather than quietly allowing
+    the delete.
+    """
     try:
         hosts = await npm_request("GET", "/api/nginx/proxy-hosts")
     except HTTPException:
-        return set()
+        return set(), False
     names: set[str] = set()
     for host in hosts:
         names.update(_npm_host_domain_names(host))
-    return names
+    return names, True
 
 
 @app.get("/api/dns")
@@ -1792,21 +2075,24 @@ async def list_dns():
 
     Only A records are returned. Follows Cloudflare pagination so zones with
     more than 100 A records are fully listed (unless an internal safety cap is hit).
-    Includes npm_proxy_domains so the UI can warn before deleting records tied to services.
+    Includes npm_proxy_domains so the UI can warn before deleting records tied to
+    services; npm_proxy_domains_available is false when NPM could not be reached
+    and that list is therefore empty rather than authoritative.
     """
     records, truncated = await _cf_fetch_zone_dns_a_records()
-    npm_domains = await _npm_proxy_domain_names()
+    npm_domains, npm_ok = await _npm_proxy_domain_names()
     return {
         "records": records,
         "truncated": truncated,
         "npm_proxy_domains": sorted(npm_domains),
+        "npm_proxy_domains_available": npm_ok,
     }
 
 
 class DNSCreate(BaseModel):
     # Accepts bare subdomain ('myservice') or FQDN — Cloudflare normalises both.
     name: str
-    content: str = ""  # default resolved to config.npm_host at request time
+    content: str = ""  # default resolved to config.dns_target at request time
     proxied: bool = False
 
     @field_validator("name")
@@ -1821,7 +2107,7 @@ class DNSCreate(BaseModel):
     @classmethod
     def validate_ip(cls, v: str) -> str:
         if not v:
-            return v  # empty string handled at endpoint level (defaults to npm_host)
+            return v  # empty string handled at endpoint level (defaults to dns_target)
         try:
             ipaddress.IPv4Address(v.strip())
         except ValueError:
@@ -1833,18 +2119,19 @@ class DNSCreate(BaseModel):
 async def create_dns(record: DNSCreate):
     """Create an A record in the Cloudflare zone.
 
-    If content is empty, defaults to config.npm_host so callers can omit it
+    If content is empty, defaults to config.dns_target so callers can omit it
     when creating standard service records that should route through NPM.
 
-    Architecture: most records should point to config.npm_host (NPM) so all
+    Architecture: most records should point to config.dns_target (NPM) so all
     traffic routes through the reverse proxy.  Use 192.0.2.1 for subdomains
     that exist only to support Cloudflare rules (no real origin server).
     """
-    target_ip = record.content or config.npm_host
-    if not target_ip:
+    target_ip = record.content or config.dns_target
+    if not _is_ipv4(target_ip):
         raise HTTPException(
             status_code=400,
-            detail="No IP provided and NPM host could not be determined — check NPM URL in settings",
+            detail="No IP provided and no DNS target IP is configured. Use an IP address in "
+            "the NPM URL or set DNS target IP in Settings.",
         )
     data = await cf_request(
         "POST",
@@ -1886,7 +2173,8 @@ async def list_proxy_hosts():
 async def list_npm_certificates():
     """List certificates in NPM.
 
-    Used by the Settings UI to help pick a wildcard certificate ID.
+    Not called by the SPA (Settings uses /api/npm/certificates/auto); kept as a
+    read-only helper for operators scripting against the console.
     """
     return await npm_request("GET", "/api/nginx/certificates")
 
@@ -1923,14 +2211,14 @@ async def scan():
       services         NPM proxy hosts enriched with their DNS record.
                        status: 'ok' | 'missing_dns'
 
-      unmatched_dns    A records pointing to config.npm_host with no proxy host.
+      unmatched_dns    A records pointing to config.dns_target with no proxy host.
                        Usually half-configured or orphaned (e.g. failed rollback).
 
-      passthrough_dns  A records NOT pointing to config.npm_host — intentional
+      passthrough_dns  A records NOT pointing to config.dns_target — intentional
                        direct/CF-only targets like short domain → 192.0.2.1.
 
-      npm_host         The NPM IP from config, so the frontend can use the correct
-                       IP when creating DNS records without hardcoding it.
+      dns_target       The IPv4 address service records point to, so the frontend
+                       can use the correct IP when creating DNS records.
     """
     dns_records, dns_truncated = await _cf_fetch_zone_dns_a_records()
     npm_hosts = await npm_request("GET", "/api/nginx/proxy-hosts")
@@ -1956,13 +2244,14 @@ async def scan():
         )
 
     # A records pointing to NPM with no proxy host — likely misconfigured/orphaned
+    dns_target = config.dns_target
     unmatched_dns: list[dict] = [
-        r for r in dns_records if r["name"] not in npm_domains and r["content"] == config.npm_host
+        r for r in dns_records if r["name"] not in npm_domains and r["content"] == dns_target
     ]
 
     # A records NOT pointing to NPM — intentional direct/CF-only targets
     passthrough_dns: list[dict] = [
-        r for r in dns_records if r["name"] not in npm_domains and r["content"] != config.npm_host
+        r for r in dns_records if r["name"] not in npm_domains and r["content"] != dns_target
     ]
 
     return {
@@ -1970,7 +2259,7 @@ async def scan():
         "unmatched_dns": unmatched_dns,
         "passthrough_dns": passthrough_dns,
         "domain": config.domain,
-        "npm_host": config.npm_host,  # for frontend use in "Add DNS" action
+        "dns_target": dns_target,  # for frontend use in "Add DNS" action
         "uptime_kuma_url": config.uptime_kuma_url,
         "homepage_url": config.homepage_url,
         "dockge_url": config.dockge_url,
@@ -2043,8 +2332,13 @@ class ServiceCreate(BaseModel):
     @classmethod
     def validate_subdomain(cls, v: str) -> str:
         v = v.strip().lower()
-        if not re.match(r"^[a-z0-9][a-z0-9\-]*$", v):
-            raise ValueError("Subdomain must be lowercase alphanumeric and hyphens only")
+        # One DNS label: 1-63 chars, letters/digits/hyphens, no leading or
+        # trailing hyphen. Cloudflare rejects anything else.
+        if not _DNS_LABEL_RE.match(v):
+            raise ValueError(
+                "Subdomain must be 1-63 lowercase letters, digits or hyphens and cannot "
+                "start or end with a hyphen"
+            )
         return v
 
     @field_validator("forward_host")
@@ -2145,7 +2439,7 @@ def _host_to_service_create(host: dict[str, Any], domain: str) -> ServiceCreate 
 async def create_service(svc: ServiceCreate):
     """Create a new service: Cloudflare DNS A record + NPM proxy host in one operation.
 
-    DNS record:  {subdomain}.{domain}  A  {npm_host}  (routes to NPM)
+    DNS record:  {subdomain}.{domain}  A  {dns_target}  (routes to NPM)
     NPM host:    {subdomain}.{domain}  →  {scheme}://{host}:{port}
 
     Rollback: if NPM proxy host creation fails after DNS is created, the DNS
@@ -2158,12 +2452,16 @@ async def create_service(svc: ServiceCreate):
     """
     domain = f"{svc.subdomain}.{config.domain}"
     dns_record_id: str | None = None
+    dns_target = config.dns_target
 
-    # Guard: npm_host is derived from npm_url; an unparseable URL returns "".
-    if not config.npm_host:
+    # Guard: Cloudflare only accepts an IPv4 address as A record content. A
+    # hostname in NPM URL without dns_target_ip would fail at Cloudflare with a
+    # less helpful message.
+    if not _is_ipv4(dns_target):
         raise HTTPException(
             status_code=400,
-            detail="Cannot determine NPM host IP from the configured NPM URL — check settings",
+            detail="No DNS target IP is configured. Use an IP address in the NPM URL or set "
+            "DNS target IP in Settings.",
         )
 
     # Step 1 — DNS A record pointing to NPM, not the backend directly.
@@ -2172,13 +2470,13 @@ async def create_service(svc: ServiceCreate):
     dns_data = await cf_request(
         "POST",
         f"/zones/{config.cf_zone_id}/dns_records",
-        json={"type": "A", "name": domain, "content": config.npm_host, "proxied": False, "ttl": 1},
+        json={"type": "A", "name": domain, "content": dns_target, "proxied": False, "ttl": 1},
     )
     result = dns_data.get("result") or {}
     dns_record_id = result.get("id")
     if not dns_record_id:
         raise HTTPException(status_code=502, detail="Cloudflare returned success but no record ID")
-    logger.info("DNS record created: %s → %s (id=%s)", domain, config.npm_host, dns_record_id)
+    logger.info("DNS record created: %s → %s (id=%s)", domain, dns_target, dns_record_id)
 
     # Step 2 — NPM proxy host.  Roll back DNS on failure.
     advanced_config = "proxy_ssl_verify off;" if svc.ssl_verify_off else ""
@@ -2239,10 +2537,10 @@ async def create_service(svc: ServiceCreate):
 
 @app.post("/api/services/batch", status_code=200)
 async def batch_services(payload: ServiceBatchRequest):
-    """Batch create services with optional dry-run preview."""
-    if not payload.items:
-        raise HTTPException(status_code=400, detail="No items provided")
+    """Batch create services with optional dry-run preview.
 
+    The item list is validated on the model (non-empty, at most 100 entries).
+    """
     # Gather existing domains for conflict warnings in dry-run.
     (dns_list, _), npm_hosts = await asyncio.gather(
         _cf_fetch_zone_dns_a_records(),
@@ -2332,7 +2630,7 @@ async def delete_service(payload: ServiceDelete):
     await npm_request("DELETE", f"/api/nginx/proxy-hosts/{payload.proxy_host_id}")
     npm_deleted = True
 
-    # Step 2: delete DNS record (by explicit ID or best-effort lookup by domain+npm_host)
+    # Step 2: delete DNS record (by explicit ID or best-effort lookup by domain+dns_target)
     if dns_target_id:
         _validate_cf_id(dns_target_id, "dns_record_id")
     else:
@@ -2342,7 +2640,7 @@ async def delete_service(payload: ServiceDelete):
             params={"name": payload.domain, "type": "A", "per_page": 10},
         )
         for rec in cf_data.get("result", []):
-            if rec.get("name") == payload.domain and rec.get("content") == config.npm_host:
+            if rec.get("name") == payload.domain and rec.get("content") == config.dns_target:
                 dns_target_id = rec.get("id")
                 break
 
@@ -2393,62 +2691,33 @@ async def delete_service(payload: ServiceDelete):
     }
 
 
-# Fields NPM accepts on PUT — same set as create_service POST payload, plus enabled.
-_SAFE_NPM_PUT_KEYS: frozenset[str] = frozenset(
-    {
-        "domain_names",
-        "forward_scheme",
-        "forward_host",
-        "forward_port",
-        "certificate_id",
-        "ssl_forced",
-        "http2_support",
-        "block_exploits",
-        "access_list_id",
-        "advanced_config",
-        "meta",
-        "locations",
-        "allow_websocket_upgrade",
-        "enabled",
-    }
-)
-
-_NPM_PUT_DEFAULTS: dict[str, Any] = {
-    "block_exploits": True,
-    "access_list_id": 0,
-    "meta": {},
-    "locations": [],
-    "http2_support": False,
-    "ssl_forced": True,
-    "allow_websocket_upgrade": False,
-    "advanced_config": "",
-}
-
-
 @app.post("/api/services/{proxy_host_id}/enabled", status_code=200)
 async def set_service_enabled(proxy_host_id: int, payload: ServiceEnabledUpdate):
-    """Enable/disable an existing NPM proxy host."""
+    """Enable or disable an existing NPM proxy host.
+
+    Uses NPM's dedicated enable/disable endpoints instead of a PUT of the whole
+    host, so no other field on the host is touched and the call keeps working
+    across NPM versions that change the PUT schema. NPM answers 400 when the
+    host is already in the requested state; that counts as success here so a
+    stale UI does not show an error for a no-op.
+    """
     if proxy_host_id <= 0:
         raise HTTPException(status_code=400, detail="Invalid proxy_host_id")
 
-    raw = await npm_request("GET", f"/api/nginx/proxy-hosts/{proxy_host_id}")
-    host = _normalize_npm_host_payload(raw)
-    if not host:
-        raise HTTPException(status_code=404, detail="Proxy host not found")
-
-    update_body: dict[str, Any] = {k: v for k, v in host.items() if k in _SAFE_NPM_PUT_KEYS}
-    for key, default in _NPM_PUT_DEFAULTS.items():
-        if key in _SAFE_NPM_PUT_KEYS and key not in update_body:
-            update_body[key] = default
-    update_body["enabled"] = payload.enabled
-
-    result = await npm_request("PUT", f"/api/nginx/proxy-hosts/{proxy_host_id}", json=update_body)
+    verb = "enable" if payload.enabled else "disable"
+    try:
+        await npm_request("POST", f"/api/nginx/proxy-hosts/{proxy_host_id}/{verb}")
+    except HTTPException as e:
+        if e.status_code == 400 and "already" in str(e.detail).lower():
+            logger.info("Proxy host %s already %sd", proxy_host_id, verb)
+        else:
+            raise
     logger.info("Set proxy host %s enabled=%s", proxy_host_id, payload.enabled)
     emit_activity(
         "service.proxy_enabled",
         {"proxy_host_id": proxy_host_id, "enabled": payload.enabled},
     )
-    return {"success": True, "proxy_host": result}
+    return {"success": True, "proxy_host_id": proxy_host_id, "enabled": payload.enabled}
 
 
 @app.get("/api/activity")
@@ -2594,4 +2863,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 @app.get("/{full_path:path}", include_in_schema=False)
 async def serve_frontend(full_path: str):
     """Serve the React SPA for all non-API, non-static routes."""
+    if full_path == "api" or full_path.startswith("api/"):
+        # An unknown API path should answer like an API error, not a 200 HTML page.
+        return JSONResponse(status_code=404, content={"detail": "Not found"})
     return FileResponse("static/index.html")

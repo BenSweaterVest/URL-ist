@@ -520,11 +520,15 @@ def test_invalid_npm_cert_id_not_configured(client: TestClient, config_path: Pat
         encoding="utf-8",
     )
     main_module._load_config()
-    r = client.get("/api/config/status")
+    # /api/auth/status is always open; /api/config/status now needs login because
+    # a console password exists.
+    r = client.get("/api/auth/status")
     assert r.status_code == 200
     data = r.json()
     assert data["configured"] is False
     assert "npm_cert_id" in data["missing_fields"]
+    assert data["login_required"] is True
+    assert client.get("/api/config/status").status_code == 401
 
 
 def test_activity_log_trim_drops_oldest(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> None:
@@ -538,3 +542,355 @@ def test_activity_log_trim_drops_oldest(monkeypatch: pytest.MonkeyPatch, config_
     assert len(kept) < 200
     assert json.loads(kept[-1])["action"] == "test.event"
     assert json.loads(kept[0])["ts"] != "t0"
+
+
+def _base_config(**extra: object) -> dict:
+    body: dict = {
+        "cf_api_token": "cfat_test",
+        "cf_account_id": "a" * 32,
+        "cf_zone_id": "b" * 32,
+        "npm_url": "http://127.0.0.1:81",
+        "npm_email": "admin@example.com",
+        "npm_password": "npmsecret",
+        "npm_cert_id": 2,
+        "domain": "example.com",
+    }
+    body.update(extra)
+    return body
+
+
+def _write_config(config_path: Path, **extra: object) -> None:
+    config_path.write_text(json.dumps(_base_config(**extra)), encoding="utf-8")
+    main_module._load_config()
+
+
+def test_partial_config_with_password_requires_login_before_wizard(
+    client: TestClient, config_path: Path
+) -> None:
+    """A stored password gates the wizard even when other settings are missing."""
+    _write_config(
+        config_path,
+        npm_cert_id=0,
+        console_password_hash=main_module._hash_console_password("ownerpassword1"),
+    )
+    assert not main_module.config.is_configured()
+
+    stranger = TestClient(main_module.app)
+    assert stranger.get("/api/config").status_code == 401
+    assert stranger.post("/api/config", json=_base_config()).status_code == 401
+
+    owner = TestClient(main_module.app)
+    assert owner.post("/api/auth/login", json={"password": "ownerpassword1"}).status_code == 200
+    status = owner.get("/api/auth/status").json()
+    assert status["authenticated"] is True and status["configured"] is False
+    # Prefill works, and secrets come back masked.
+    cfg = owner.get("/api/config").json()
+    assert cfg["cf_account_id"] == "a" * 32
+    assert main_module.MASK_CHAR in cfg["cf_api_token"]
+    # Fixing the cert ID (sending masked secrets back) completes setup and keeps the token.
+    fix = _base_config(cf_api_token=cfg["cf_api_token"], npm_password=cfg["npm_password"])
+    r = owner.post("/api/config", json=fix, headers={"X-CSRF-Token": status["csrf_token"]})
+    assert r.status_code == 200, r.text
+    assert main_module.config.is_configured()
+    assert main_module.config.cf_api_token == "cfat_test"
+    # The old password still works: nothing was overwritten.
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert main_module._verify_console_password("ownerpassword1", saved["console_password_hash"])
+
+
+def test_configured_without_password_stays_in_setup_mode(
+    client: TestClient, config_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Env-only deploy that omits CONSOLE_PASSWORD: only the wizard answers until a password is set."""
+    monkeypatch.delenv("CONSOLE_PASSWORD", raising=False)
+    _write_config(config_path)
+    assert main_module.config.is_configured()
+    assert not main_module._login_required()
+
+    assert client.get("/api/links").status_code == 503
+    assert client.get("/api/config/export").status_code == 503
+    assert client.get("/api/auth/status").json()["console_password_set"] is False
+    assert client.get("/api/config").status_code == 200
+
+    # No session exists yet, so the wizard save must not require a CSRF header.
+    r = client.post(
+        "/api/config",
+        json=_base_config(console_password="longenough12", console_password_confirm="longenough12"),
+    )
+    assert r.status_code == 200, r.text
+    assert main_module._login_required()
+    assert TestClient(main_module.app).get("/api/links").status_code == 401
+    assert client.post("/api/auth/login", json={"password": "longenough12"}).status_code == 200
+
+
+def test_session_secret_status_reports_key_in_use(configured_client: TestClient) -> None:
+    """After the wizard writes a key to disk the process is still on its runtime key."""
+    data = configured_client.get("/api/health").json()
+    assert data["session_secret_source"] == main_module._ACTIVE_SESSION_SECRET_SOURCE
+    if main_module._ACTIVE_SESSION_SECRET_SOURCE == "runtime":
+        assert data["session_secret_restart_needed"] is True
+    status = configured_client.get("/api/auth/status").json()
+    assert status["session_secret_restart_needed"] == data["session_secret_restart_needed"]
+
+
+def test_activity_log_trim_is_fast(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> None:
+    import time
+
+    path = config_path.parent / "activity.jsonl"
+    line = json.dumps(
+        {"ts": "t", "action": "service.created", "detail": {"domain": "x.example.com"}}
+    )
+    n = main_module._ACTIVITY_MAX_BYTES // (len(line) + 1) + 50
+    path.write_bytes(("\n".join([line] * n) + "\n").encode())
+    t0 = time.perf_counter()
+    main_module.emit_activity("test.event", {"n": 1})
+    assert time.perf_counter() - t0 < 2.0
+    assert path.stat().st_size <= main_module._ACTIVITY_TRIM_TARGET_BYTES + len(line) + 200
+    kept = path.read_text(encoding="utf-8").splitlines()
+    assert json.loads(kept[-1])["action"] == "test.event"
+
+
+def test_create_link_waits_for_cloudflare_operation(
+    links_ready: TestClient, csrf_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    polls: list[str] = []
+    statuses = iter(["pending", "completed"])
+
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        if method == "POST" and path.endswith("/items"):
+            return {"result": {"operation_id": "op123"}}
+        if method == "GET" and "/bulk_operations/" in path:
+            polls.append(path)
+            return {"result": {"id": "op123", "status": next(statuses)}}
+        return {"result": []}
+
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    monkeypatch.setattr(main_module, "_CF_LIST_OP_POLL_SEC", 0.0)
+    r = links_ready.post(
+        "/api/links", json={"slug": "ha", "target": "https://x.example.com"}, headers=csrf_headers
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["pending"] is False
+    assert len(polls) == 2 and polls[0].endswith("/bulk_operations/op123")
+
+
+def test_create_link_surfaces_failed_operation(
+    links_ready: TestClient, csrf_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        if method == "POST" and path.endswith("/items"):
+            return {"result": {"operation_id": "op1"}}
+        if "/bulk_operations/" in path:
+            return {"result": {"status": "failed", "error": "duplicate source_url"}}
+        return {"result": []}
+
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    r = links_ready.post(
+        "/api/links", json={"slug": "ha", "target": "https://x.example.com"}, headers=csrf_headers
+    )
+    assert r.status_code == 502
+    assert "duplicate source_url" in r.json()["detail"]
+
+
+def test_update_link_waits_for_delete_before_create(
+    links_ready: TestClient, csrf_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        if method == "GET" and f"/items/{_LINK_ITEM_ID}" in path:
+            return {
+                "result": {
+                    "id": _LINK_ITEM_ID,
+                    "redirect": {
+                        "source_url": "https://short.example.com/ha",
+                        "target_url": "https://old",
+                    },
+                }
+            }
+        if method == "DELETE":
+            calls.append("delete")
+            return {"result": {"operation_id": "del"}}
+        if method == "POST":
+            calls.append("create")
+            return {"result": {"operation_id": "add"}}
+        if "/bulk_operations/" in path:
+            calls.append("poll:" + path.rsplit("/", 1)[-1])
+            return {"result": {"status": "completed"}}
+        return {"result": []}
+
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    r = links_ready.put(
+        f"/api/links/{_LINK_ITEM_ID}", json={"target": "https://new"}, headers=csrf_headers
+    )
+    assert r.status_code == 200, r.text
+    assert calls == ["delete", "poll:del", "create", "poll:add"]
+
+
+def test_missing_status_code_is_read_as_cloudflare_default_301() -> None:
+    assert main_module._redirect_status_from_item({"redirect": {}}) == 301
+    assert main_module._redirect_status_from_item({"redirect": {"status_code": 302}}) == 302
+
+
+def test_save_config_normalizes_domains_and_ids(client: TestClient, config_path: Path) -> None:
+    body = _base_config(
+        cf_account_id="A" * 32,
+        domain="Example.COM.",
+        short_domain="https://Short.Example.com/",
+        console_password="longenough12",
+        console_password_confirm="longenough12",
+    )
+    assert client.post("/api/config", json=body).status_code == 200
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+    assert saved["cf_account_id"] == "a" * 32
+    assert saved["domain"] == "example.com"
+    assert saved["short_domain"] == "short.example.com"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("cf_account_id", "not-hex"),
+        ("cf_zone_id", "b" * 31),
+        ("short_domain", "bad_host!"),
+        ("dns_target_ip", "npm.lan"),
+    ],
+)
+def test_save_config_rejects_invalid_values(client: TestClient, field: str, value: str) -> None:
+    body = _base_config(console_password="longenough12", console_password_confirm="longenough12")
+    body[field] = value
+    assert client.post("/api/config", json=body).status_code == 422
+
+
+def test_npm_hostname_requires_dns_target_ip(client: TestClient, config_path: Path) -> None:
+    body = _base_config(
+        npm_url="http://npm.lan:81",
+        console_password="longenough12",
+        console_password_confirm="longenough12",
+    )
+    r = client.post("/api/config", json=body)
+    assert r.status_code == 422
+    assert "DNS target IP" in r.text
+    body["dns_target_ip"] = "10.0.0.9"
+    assert client.post("/api/config", json=body).status_code == 200
+    assert main_module.config.dns_target == "10.0.0.9"
+    assert main_module.config.is_configured()
+
+
+def test_create_service_uses_dns_target_ip(
+    configured_client: TestClient, csrf_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict = {}
+
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        captured["dns"] = kwargs.get("json")
+        return {"result": {"id": "c" * 32}}
+
+    async def fake_npm_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        return {}
+
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    monkeypatch.setattr(main_module, "npm_request", fake_npm_request)
+    main_module.config.npm_url = "http://npm.lan:81"
+    main_module.config.dns_target_ip = "10.0.0.9"
+    r = configured_client.post(
+        "/api/services",
+        json={"subdomain": "app", "forward_host": "10.0.0.5", "forward_port": 80},
+        headers=csrf_headers,
+    )
+    assert r.status_code == 201, r.text
+    assert captured["dns"]["content"] == "10.0.0.9"
+
+
+def test_create_service_rejects_bad_subdomain(
+    configured_client: TestClient, csrf_headers: dict[str, str]
+) -> None:
+    for sub in ("app-", "-app", "a" * 64):
+        r = configured_client.post(
+            "/api/services",
+            json={"subdomain": sub, "forward_host": "10.0.0.5", "forward_port": 80},
+            headers=csrf_headers,
+        )
+        assert r.status_code == 422, sub
+
+
+def test_unknown_api_route_returns_json_404(configured_client: TestClient) -> None:
+    r = configured_client.get("/api/does-not-exist")
+    assert r.status_code == 404
+    assert r.json() == {"detail": "Not found"}
+    # The SPA catch-all still serves everything else.
+    assert configured_client.get("/some/page").headers["content-type"].startswith("text/html")
+
+
+def test_set_service_enabled_uses_npm_toggle_endpoints(
+    configured_client: TestClient, csrf_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str]] = []
+
+    async def fake_npm_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        calls.append((method, path))
+        if path.endswith("/enable"):
+            raise HTTPException(status_code=400, detail="NPM: Host is already enabled")
+        return True
+
+    monkeypatch.setattr(main_module, "npm_request", fake_npm_request)
+    r = configured_client.post(
+        "/api/services/7/enabled", json={"enabled": False}, headers=csrf_headers
+    )
+    assert r.status_code == 200 and r.json()["enabled"] is False
+    # Already in the requested state is not an error.
+    r2 = configured_client.post(
+        "/api/services/7/enabled", json={"enabled": True}, headers=csrf_headers
+    )
+    assert r2.status_code == 200
+    assert calls == [
+        ("POST", "/api/nginx/proxy-hosts/7/disable"),
+        ("POST", "/api/nginx/proxy-hosts/7/enable"),
+    ]
+
+
+def test_list_dns_flags_npm_unavailable(
+    configured_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        return {"result": [], "result_info": {"total_pages": 1}}
+
+    async def fake_npm_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        raise HTTPException(status_code=503, detail="Cannot reach NPM")
+
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    monkeypatch.setattr(main_module, "npm_request", fake_npm_request)
+    data = configured_client.get("/api/dns").json()
+    assert data["npm_proxy_domains"] == []
+    assert data["npm_proxy_domains_available"] is False
+
+
+def test_login_rate_limit_forgets_quiet_addresses(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = [1000.0]
+    monkeypatch.setattr(main_module.time, "monotonic", lambda: now[0])
+    main_module._record_login_attempt("10.0.0.1")
+    assert "10.0.0.1" in main_module._login_attempts
+    now[0] += main_module._LOGIN_RATE_WINDOW_SEC + 1
+    main_module._record_login_attempt("10.0.0.2")
+    assert "10.0.0.1" not in main_module._login_attempts
+    assert "10.0.0.2" in main_module._login_attempts
+
+
+def test_create_link_reports_pending_when_status_read_fails(
+    links_ready: TestClient, csrf_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed status poll must not turn an accepted write into an error."""
+
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        if method == "POST" and path.endswith("/items"):
+            return {"result": {"operation_id": "op9"}}
+        if "/bulk_operations/" in path:
+            raise HTTPException(status_code=503, detail="Cannot reach Cloudflare")
+        return {"result": []}
+
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    r = links_ready.post(
+        "/api/links", json={"slug": "ha", "target": "https://x.example.com"}, headers=csrf_headers
+    )
+    assert r.status_code == 201, r.text
+    assert r.json()["pending"] is True
