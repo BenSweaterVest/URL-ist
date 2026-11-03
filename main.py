@@ -1056,6 +1056,27 @@ async def security_gate(request: Request, call_next):
     return await call_next(request)
 
 
+_SECURITY_HEADERS = {
+    # The console holds Cloudflare and NPM credentials: never allow framing
+    # (clickjacking) and do not leak console URLs to integration links.
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Add defensive headers to every response; API responses are never cached."""
+    response = await call_next(request)
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     """Propagate X-Request-ID for tracing; bump API request metrics."""

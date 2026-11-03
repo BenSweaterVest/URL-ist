@@ -1190,3 +1190,12 @@ def test_npm_request_reauthenticates_once_on_401(
 
     asyncio.run(run())
     main_module._npm_token = None
+
+
+def test_security_headers(configured_client: TestClient) -> None:
+    for path in ("/", "/api/health", "/api/links-not-a-route"):
+        r = configured_client.get(path)
+        assert r.headers["x-frame-options"] == "DENY", path
+        assert r.headers["x-content-type-options"] == "nosniff"
+        assert r.headers["referrer-policy"] == "no-referrer"
+    assert configured_client.get("/api/health").headers["cache-control"] == "no-store"
