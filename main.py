@@ -34,7 +34,8 @@ Optional fields (env var names shown, built-in defaults listed):
                   NPM_URL; required when NPM_URL uses a hostname.
   CONFIG_FILE      Override path to config JSON           (/data/config.json)
   SESSION_SECRET   Key for signing login session cookies (>=16 chars). Optional if
-                   session_secret is stored in config.json (auto-generated on first save).
+                   session_secret is stored in config.json (auto-generated on first
+                   save and used from the next request, no restart needed).
   CONSOLE_PASSWORD Plaintext console password for env-only bootstrap; first login
                    persists a hash to config.json (see README). Without it (and with
                    no hash in config.json) the console stays in setup mode and only
@@ -80,7 +81,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 logger = logging.getLogger("urler")
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 CF_BASE = "https://api.cloudflare.com/client/v4"
 MASK_CHAR = "•"  # used to mask secrets in GET /api/config responses
