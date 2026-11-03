@@ -1736,7 +1736,9 @@ function ServicesPanel({ toast, onMutate }) {
     setSaving(true);
     try {
       const res = await api('POST', '/api/services', { ...form, forward_port: Number(form.forward_port) });
-      toast(`${res.domain} created`, 'ok');
+      toast(res.dns_reused
+        ? `${res.domain} created (reused its existing DNS record)`
+        : `${res.domain} created`, 'ok');
       setCreated(res);
       setShowAdd(false); setForm(EMPTY_FORM); setAddError('');
       load(true); onMutate();

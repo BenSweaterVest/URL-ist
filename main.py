@@ -1312,33 +1312,47 @@ async def npm_request(method: str, path: str, **kwargs) -> Any:
     """Make an authenticated request to the Nginx Proxy Manager API.
 
     Acquires a token on first call (or after expiry) and wraps errors into
-    HTTPException with the actual NPM error message.
+    HTTPException with the actual NPM error message. A 401 on a cached token
+    (expired, or revoked by an NPM restart or password change) drops the cache
+    and retries once with a fresh token.
     """
-    token = await get_npm_token()
-    url = f"{config.npm_url.rstrip('/')}{path}"
+    global _npm_token, _npm_token_expires
     if not _npm_client:
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
-    try:
-        r = await _npm_client.request(
-            method,
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            **kwargs,
-        )
-        r.raise_for_status()
-        return r.json()
-    except httpx.HTTPStatusError as e:
+    url = f"{config.npm_url.rstrip('/')}{path}"
+    for attempt in (1, 2):
+        token = await get_npm_token()
         try:
-            msg = e.response.json().get("error", e.response.text)
-        except Exception:
-            msg = e.response.text
-        logger.error("NPM %s %s → %s: %s", method, path, e.response.status_code, msg)
-        raise HTTPException(status_code=e.response.status_code, detail=f"NPM: {msg}") from None
-    except httpx.RequestError as e:
-        logger.error("NPM unreachable: %s", e)
-        raise HTTPException(
-            status_code=503, detail=f"Cannot reach NPM at {config.npm_url}: {str(e)}"
-        ) from None
+            r = await _npm_client.request(
+                method,
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                **kwargs,
+            )
+            if r.status_code == 401 and attempt == 1:
+                logger.info("NPM rejected cached token; re-authenticating")
+                _npm_token = None
+                _npm_token_expires = 0.0
+                continue
+            r.raise_for_status()
+            if not r.content:
+                return {}
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            try:
+                msg = e.response.json().get("error", e.response.text)
+                if isinstance(msg, dict):
+                    msg = msg.get("message") or json.dumps(msg)
+            except Exception:
+                msg = e.response.text
+            logger.error("NPM %s %s → %s: %s", method, path, e.response.status_code, msg)
+            raise HTTPException(status_code=e.response.status_code, detail=f"NPM: {msg}") from None
+        except httpx.RequestError as e:
+            logger.error("NPM unreachable: %s", e)
+            raise HTTPException(
+                status_code=503, detail=f"Cannot reach NPM at {config.npm_url}: {str(e)}"
+            ) from None
+    raise HTTPException(status_code=502, detail="NPM: authentication failed after retry")
 
 
 # ── Input validation helpers ───────────────────────────────────────────────────
@@ -1994,14 +2008,24 @@ async def delete_link(item_id: str):
     list_id = await get_list_id()
     if not list_id:
         raise HTTPException(404, "Shortlink list not found")
+    # Read the item first so the activity log names the slug, not just an opaque ID.
+    source_url = ""
+    try:
+        existing = await _cf_get_list_item(list_id, item_id)
+        source_url = str((existing.get("redirect") or {}).get("source_url", ""))
+    except HTTPException as e:
+        if e.status_code == 404:
+            raise
+        logger.warning("Could not read short link %s before delete: %s", item_id, e.detail)
     data = await cf_request(
         "DELETE",
         f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
         json={"items": [{"id": item_id}]},
     )
     completed = await _cf_wait_list_operation(data, f"delete {item_id}")
-    logger.info("Deleted short link: %s", item_id)
-    emit_activity("link.deleted", {"item_id": item_id})
+    slug = (urlparse(source_url).path or "").strip("/") if source_url else ""
+    logger.info("Deleted short link: %s (%s)", slug or item_id, item_id)
+    emit_activity("link.deleted", {"item_id": item_id, "slug": slug, "source_url": source_url})
     return {"success": True, "pending": not completed}
 
 
@@ -2141,9 +2165,19 @@ class DNSCreate(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_name(cls, v: str) -> str:
-        v = v.strip().lower()
+        v = v.strip().lower().rstrip(".")
         if not v:
             raise ValueError("Name cannot be empty")
+        if v == "@":
+            return v  # zone apex
+        labels = v.split(".")
+        if labels[0] == "*":
+            labels = labels[1:]  # wildcard record
+        if not labels or not all(_DNS_LABEL_RE.match(label) for label in labels):
+            raise ValueError(
+                "Name must be a hostname: labels of letters, digits and hyphens "
+                "(optionally starting with '*.')"
+            )
         return v
 
     @field_validator("content")
@@ -2478,52 +2512,35 @@ def _host_to_service_create(host: dict[str, Any], domain: str) -> ServiceCreate 
         return None
 
 
-@app.post("/api/services", status_code=201)
-async def create_service(svc: ServiceCreate):
-    """Create a new service: Cloudflare DNS A record + NPM proxy host in one operation.
+# NPM proxy-host fields carried through delete → trash → restore so a restored
+# host matches the deleted one (custom locations, advanced config, HSTS, ...).
+_NPM_HOST_RESTORE_FIELDS = (
+    "domain_names",
+    "forward_scheme",
+    "forward_host",
+    "forward_port",
+    "certificate_id",
+    "ssl_forced",
+    "hsts_enabled",
+    "hsts_subdomains",
+    "http2_support",
+    "block_exploits",
+    "caching_enabled",
+    "allow_websocket_upgrade",
+    "access_list_id",
+    "advanced_config",
+    "locations",
+)
 
-    DNS record:  {subdomain}.{domain}  A  {dns_target}  (routes to NPM)
-    NPM host:    {subdomain}.{domain}  →  {scheme}://{host}:{port}
 
-    Rollback: if NPM proxy host creation fails after DNS is created, the DNS
-    record is deleted before re-raising.  If rollback also fails, the orphaned
-    record ID is logged for manual cleanup in the Cloudflare dashboard.
+def _npm_host_restore_snapshot(host: dict[str, Any]) -> dict[str, Any]:
+    """Subset of an NPM proxy host that is safe and useful to send back on restore."""
+    return {k: host[k] for k in _NPM_HOST_RESTORE_FIELDS if k in host}
 
-    Retry: if a previous attempt left an orphaned DNS record, retrying will fail
-    at Step 1 with 'record already exists'.  Delete the orphaned record from the
-    DNS tab first, then retry here.
-    """
-    domain = f"{svc.subdomain}.{config.domain}"
-    dns_record_id: str | None = None
-    dns_target = config.dns_target
 
-    # Guard: Cloudflare only accepts an IPv4 address as A record content. A
-    # hostname in NPM URL without dns_target_ip would fail at Cloudflare with a
-    # less helpful message.
-    if not _is_ipv4(dns_target):
-        raise HTTPException(
-            status_code=400,
-            detail="No DNS target IP is configured. Use an IP address in the NPM URL or set "
-            "DNS target IP in Settings.",
-        )
-
-    # Step 1 — DNS A record pointing to NPM, not the backend directly.
-    # Traffic flows: browser → Cloudflare DNS → NPM → backend service.
-    # NPM handles TLS termination and proxying; the backend never exposes a port.
-    dns_data = await cf_request(
-        "POST",
-        f"/zones/{config.cf_zone_id}/dns_records",
-        json={"type": "A", "name": domain, "content": dns_target, "proxied": False, "ttl": 1},
-    )
-    result = dns_data.get("result") or {}
-    dns_record_id = result.get("id")
-    if not dns_record_id:
-        raise HTTPException(status_code=502, detail="Cloudflare returned success but no record ID")
-    logger.info("DNS record created: %s → %s (id=%s)", domain, dns_target, dns_record_id)
-
-    # Step 2 — NPM proxy host.  Roll back DNS on failure.
-    advanced_config = "proxy_ssl_verify off;" if svc.ssl_verify_off else ""
-    npm_payload = {
+def _service_npm_payload(svc: ServiceCreate, domain: str) -> dict[str, Any]:
+    """Default NPM proxy-host body for a new service."""
+    return {
         "domain_names": [domain],
         "forward_scheme": svc.forward_scheme,
         "forward_host": svc.forward_host,
@@ -2536,11 +2553,95 @@ async def create_service(svc: ServiceCreate):
         "http2_support": False,
         "meta": {},
         "locations": [],
-        "advanced_config": advanced_config,
+        "advanced_config": "proxy_ssl_verify off;" if svc.ssl_verify_off else "",
     }
+
+
+async def _find_dns_a_record(name: str) -> dict[str, Any] | None:
+    """Return the zone's A record with exactly this name, if any."""
+    data = await cf_request(
+        "GET",
+        f"/zones/{config.cf_zone_id}/dns_records",
+        params={"name": name, "type": "A", "per_page": 10},
+    )
+    results = data.get("result") if isinstance(data, dict) else None
+    for rec in results if isinstance(results, list) else []:
+        if str(rec.get("name", "")).lower() == name:
+            return rec
+    return None
+
+
+async def _create_service(
+    svc: ServiceCreate, npm_host_snapshot: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Create DNS + NPM proxy host. See create_service for the behaviour.
+
+    npm_host_snapshot, when given (trash restore), overrides the default proxy
+    host settings so the restored host matches the one that was deleted.
+    """
+    domain = f"{svc.subdomain}.{config.domain}"
+    dns_target = config.dns_target
+
+    # Guard: Cloudflare only accepts an IPv4 address as A record content. A
+    # hostname in NPM URL without dns_target_ip would fail at Cloudflare with a
+    # less helpful message.
+    if not _is_ipv4(dns_target):
+        raise HTTPException(
+            status_code=400,
+            detail="No DNS target IP is configured. Use an IP address in the NPM URL or set "
+            "DNS target IP in Settings.",
+        )
+
+    # Step 0 — conflicts. Checking NPM first means a duplicate never touches DNS.
+    npm_hosts = await npm_request("GET", "/api/nginx/proxy-hosts")
+    for host in npm_hosts if isinstance(npm_hosts, list) else []:
+        if domain in _npm_host_domain_names(host):
+            raise HTTPException(
+                status_code=409,
+                detail=f"An NPM proxy host for {domain} already exists (id {host.get('id')}).",
+            )
+
+    # Step 1 — DNS A record pointing to NPM, not the backend directly.
+    # Traffic flows: browser → Cloudflare DNS → NPM → backend service.
+    # A record left behind by an earlier failed attempt is reused when it already
+    # points at NPM; one pointing anywhere else is a real conflict.
+    existing = await _find_dns_a_record(domain)
+    dns_created = False
+    if existing:
+        if existing.get("content") != dns_target:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A DNS record for {domain} already exists and points to "
+                f"{existing.get('content')}, not {dns_target}. Change or delete it first.",
+            )
+        dns_record_id = str(existing.get("id") or "")
+        logger.info("Reusing existing DNS record for %s (id=%s)", domain, dns_record_id)
+    else:
+        dns_data = await cf_request(
+            "POST",
+            f"/zones/{config.cf_zone_id}/dns_records",
+            json={"type": "A", "name": domain, "content": dns_target, "proxied": False, "ttl": 1},
+        )
+        result = dns_data.get("result") or {}
+        dns_record_id = str(result.get("id") or "")
+        if not dns_record_id:
+            raise HTTPException(
+                status_code=502, detail="Cloudflare returned success but no record ID"
+            )
+        dns_created = True
+        logger.info("DNS record created: %s → %s (id=%s)", domain, dns_target, dns_record_id)
+
+    # Step 2 — NPM proxy host.  Roll back a DNS record we created on failure.
+    npm_payload = _service_npm_payload(svc, domain)
+    if npm_host_snapshot:
+        npm_payload.update(_npm_host_restore_snapshot(npm_host_snapshot))
+        if domain not in [str(d).lower() for d in npm_payload.get("domain_names") or []]:
+            npm_payload["domain_names"] = [domain]
     try:
-        await npm_request("POST", "/api/nginx/proxy-hosts", json=npm_payload)
+        npm_host = await npm_request("POST", "/api/nginx/proxy-hosts", json=npm_payload)
     except HTTPException:
+        if not dns_created:
+            raise
         logger.warning(
             "NPM host creation failed for %s; rolling back DNS %s", domain, dns_record_id
         )
@@ -2556,26 +2657,38 @@ async def create_service(svc: ServiceCreate):
             )
         raise  # re-raise original NPM error to the frontend
 
-    logger.info(
-        "Service created: %s → %s://%s:%s",
-        domain,
-        svc.forward_scheme,
-        svc.forward_host,
-        svc.forward_port,
-    )
+    backend = f"{npm_payload['forward_scheme']}://{npm_payload['forward_host']}:{npm_payload['forward_port']}"
+    logger.info("Service created: %s → %s", domain, backend)
     emit_activity(
         "service.created",
-        {
-            "domain": domain,
-            "backend": f"{svc.forward_scheme}://{svc.forward_host}:{svc.forward_port}",
-        },
+        {"domain": domain, "backend": backend, "dns_reused": not dns_created},
     )
     return {
         "success": True,
         "domain": domain,
         "dns_id": dns_record_id,
-        "backend": f"{svc.forward_scheme}://{svc.forward_host}:{svc.forward_port}",
+        "dns_reused": not dns_created,
+        "proxy_host_id": npm_host.get("id") if isinstance(npm_host, dict) else None,
+        "backend": backend,
     }
+
+
+@app.post("/api/services", status_code=201)
+async def create_service(svc: ServiceCreate):
+    """Create a new service: Cloudflare DNS A record + NPM proxy host in one operation.
+
+    DNS record:  {subdomain}.{domain}  A  {dns_target}  (routes to NPM)
+    NPM host:    {subdomain}.{domain}  →  {scheme}://{host}:{port}
+
+    Conflicts: an existing NPM host for the domain is a 409 before anything is
+    written. An existing A record that already points at NPM (typically left by
+    an earlier failed attempt) is reused; one pointing elsewhere is a 409.
+
+    Rollback: if NPM proxy host creation fails after this call created the DNS
+    record, the record is deleted before re-raising. A reused record is left
+    alone. If rollback fails, the orphaned record ID is logged.
+    """
+    return await _create_service(svc)
 
 
 @app.post("/api/services/batch", status_code=200)
@@ -2595,13 +2708,19 @@ async def batch_services(payload: ServiceBatchRequest):
         existing_npm.update(_npm_host_domain_names(h))
 
     plan: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for item in payload.items:
         domain = f"{item.subdomain}.{config.domain}"
         warnings: list[str] = []
+        if domain in seen:
+            warnings.append("Listed more than once in this batch; only the first is applied")
+        seen.add(domain)
         if domain in existing_dns:
-            warnings.append("DNS record already exists")
+            warnings.append(
+                "DNS record already exists (reused if it points at NPM, otherwise this item fails)"
+            )
         if domain in existing_npm:
-            warnings.append("NPM proxy host already exists")
+            warnings.append("NPM proxy host already exists; this item will fail")
         plan.append(
             {
                 "domain": domain,
@@ -2615,9 +2734,19 @@ async def batch_services(payload: ServiceBatchRequest):
 
     created: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    applied: set[str] = set()
     for item in payload.items:
+        domain = f"{item.subdomain}.{config.domain}"
+        if domain in applied:
+            failed.append(
+                {"domain": domain, "error": "Duplicate entry in this batch", "status_code": 409}
+            )
+            if not payload.continue_on_error:
+                break
+            continue
+        applied.add(domain)
         try:
-            res = await create_service(item)
+            res = await _create_service(item)
             created.append(res)
         except HTTPException as e:
             failed.append(
@@ -2661,6 +2790,7 @@ async def delete_service(payload: ServiceDelete):
     dns_target_id = payload.dns_record_id
 
     restore_svc: ServiceCreate | None = None
+    host_dict: dict[str, Any] | None = None
     try:
         raw_h = await npm_request("GET", f"/api/nginx/proxy-hosts/{payload.proxy_host_id}")
         host_dict = _normalize_npm_host_payload(raw_h)
@@ -2707,6 +2837,7 @@ async def delete_service(payload: ServiceDelete):
                 "ts": datetime.now(UTC).isoformat(),
                 "domain": payload.domain,
                 "service": restore_svc.model_dump(),
+                "npm_host": _npm_host_restore_snapshot(host_dict or {}),
             }
         )
 
@@ -2888,7 +3019,8 @@ async def restore_trashed_service(entry_id: str):
         svc = ServiceCreate(**entry["service"])
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid trash payload: {e}") from e
-    await create_service(svc)
+    snapshot = entry.get("npm_host") if isinstance(entry.get("npm_host"), dict) else None
+    await _create_service(svc, npm_host_snapshot=snapshot)
     trash_remove(entry_id)
     emit_activity("service.restored_from_trash", {"domain": entry.get("domain")})
     return {"success": True}
