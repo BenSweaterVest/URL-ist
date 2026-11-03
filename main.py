@@ -1829,7 +1829,10 @@ async def list_links():
 
 @app.get("/api/links/preflight")
 async def short_links_preflight():
-    """Check short-link readiness: bulk redirect list + short-domain DNS (proxied A).
+    """Check short-link readiness: bulk redirect list + proxied short-domain DNS.
+
+    The short domain may be an A, AAAA or CNAME record; Tofu creates an A
+    record, but any proxied record lets Cloudflare apply bulk redirects.
 
     Intended for the Short Links tab and for operators scripting checks. Does not
     validate account-level ruleset presence (requires extra API scope); Tofu
@@ -1850,9 +1853,15 @@ async def short_links_preflight():
             data = await cf_request(
                 "GET",
                 f"/zones/{config.cf_zone_id}/dns_records",
-                params={"name": name, "type": "A", "per_page": 10},
+                params={"name": name, "per_page": 20},
             )
-            results = data.get("result", [])
+            results = [
+                r
+                for r in data.get("result", [])
+                if str(r.get("type") or "A").upper() in ("A", "AAAA", "CNAME")
+            ]
+            # Prefer a proxied record when several exist (e.g. A + AAAA).
+            results.sort(key=lambda r: r.get("proxied") is not True)
             if results:
                 rec = results[0]
                 dns_block["found"] = True
@@ -1860,13 +1869,13 @@ async def short_links_preflight():
                 dns_block["name"] = rec.get("name", name)
                 if rec.get("proxied") is False:
                     dns_block["hint"] = (
-                        "This A record should be proxied (orange cloud) so Cloudflare "
+                        "This record should be proxied (orange cloud) so Cloudflare "
                         "can intercept requests and apply bulk redirects at the edge."
                     )
             else:
                 dns_block["hint"] = (
-                    "No A record for this hostname in the zone — run Tofu bootstrap "
-                    "or add a proxied A record for the short domain."
+                    "No A, AAAA or CNAME record for this hostname in the zone — run Tofu "
+                    "bootstrap or add a proxied record for the short domain."
                 )
         except HTTPException as e:
             dns_block["hint"] = str(e.detail)
@@ -1881,7 +1890,7 @@ async def short_links_preflight():
             "Short Links Domain is not set — open Settings and set it to e.g. short.example.com."
         )
     elif dns_block["checked"] and not dns_block["found"]:
-        issues.append(f"No A record in this zone for {name}.")
+        issues.append(f"No A, AAAA or CNAME record in this zone for {name}.")
     elif dns_block["checked"] and dns_block["found"] and dns_block.get("proxied") is False:
         issues.append("Short domain exists but is DNS-only (grey cloud) — enable proxying.")
 
@@ -2081,6 +2090,10 @@ async def update_link(item_id: str, payload: LinkUpdate):
     slug = path.split("/")[-1] if path else ""
     if not slug:
         raise HTTPException(status_code=400, detail="Could not resolve slug from source_url")
+
+    # Editing is delete + recreate, so skip it entirely when nothing changes.
+    if payload.target == old_target and status_code == _redirect_status_from_item(existing):
+        return {"success": True, "slug": slug, "pending": False, "unchanged": True}
 
     items_path = f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items"
 

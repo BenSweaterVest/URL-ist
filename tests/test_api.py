@@ -1199,3 +1199,62 @@ def test_security_headers(configured_client: TestClient) -> None:
         assert r.headers["x-content-type-options"] == "nosniff"
         assert r.headers["referrer-policy"] == "no-referrer"
     assert configured_client.get("/api/health").headers["cache-control"] == "no-store"
+
+
+def test_preflight_accepts_proxied_cname(
+    monkeypatch: pytest.MonkeyPatch, configured_client: TestClient
+) -> None:
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        if path.endswith("/rules/lists"):
+            return {"result": [{"name": "shortlinks", "id": "abc123"}]}
+        if path.endswith("/dns_records"):
+            assert "type" not in kwargs.get("params", {})
+            return {
+                "result": [
+                    {"name": "short.example.com", "type": "TXT", "proxied": False},
+                    {"name": "short.example.com", "type": "CNAME", "proxied": True},
+                ]
+            }
+        return {"result": []}
+
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    main_module.config.short_domain = "short.example.com"
+    main_module._list_id_cache = None
+    payload = configured_client.get("/api/links/preflight").json()
+    assert payload["ready"] is True
+    assert payload["dns"]["proxied"] is True
+
+
+def test_update_link_without_changes_does_not_touch_cloudflare(
+    configured_client: TestClient, csrf_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writes: list[str] = []
+
+    async def fake_get_list_id() -> str:
+        return "f" * 32
+
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        if method != "GET":
+            writes.append(method)
+        return {
+            "result": {
+                "id": _LINK_ITEM_ID,
+                "redirect": {
+                    "source_url": "https://s.example.com/ha",
+                    "target_url": "https://ha.example.com",
+                    "status_code": 302,
+                },
+            }
+        }
+
+    monkeypatch.setattr(main_module, "get_list_id", fake_get_list_id)
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    main_module.config.short_domain = "s.example.com"
+    r = configured_client.put(
+        f"/api/links/{_LINK_ITEM_ID}",
+        json={"target": " https://ha.example.com ", "status_code": 302},
+        headers=csrf_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["unchanged"] is True
+    assert writes == []

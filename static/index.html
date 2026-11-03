@@ -1181,6 +1181,10 @@ function LinksPanel({ toast, onMutate }) {
       setAddError('Destination must start with https:// or http://');
       return;
     }
+    if (slugTaken) {
+      setAddError(`/${slug} already exists. Edit it instead, or pick another slug.`);
+      return;
+    }
     setSaving(true);
     try {
       const res = await api('POST', '/api/links', { slug, target, status_code: statusCode });
@@ -1247,6 +1251,11 @@ function LinksPanel({ toast, onMutate }) {
     return s.includes(q) || t.includes(q) || u.includes(q);
   });
   const slugOk = !slug || validateSlug(slug);
+  const slugTaken = !!slug && items.some(item => parseSlug(item.redirect?.source_url) === slug);
+  const editOriginal = editItem ? items.find(item => item.id === editItem.id) : null;
+  const editUnchanged = !!editOriginal
+    && (editOriginal.redirect?.target_url || '') === editTarget.trim()
+    && (editOriginal.redirect?.status_code ?? CF_IMPLICIT_REDIRECT_STATUS) === editStatusCode;
   const targetOk = !target || targetUrlOk(target);
   const nearQuota = items.length >= 450;
   const listTruncated = data?.truncated === true;
@@ -1374,6 +1383,7 @@ function LinksPanel({ toast, onMutate }) {
                 onChange={e => setSlug(e.target.value.toLowerCase().replace(/[^a-z0-9\-_]/g, ''))} />
             </div>
             {slug && !slugOk && <div className="field-err">Invalid slug format</div>}
+            {slugOk && slugTaken && <div className="field-err">/{slug} already exists</div>}
             <div className="field-hint">Lowercase letters, numbers, hyphens, underscores</div>
           </div>
           <div className="field">
@@ -1396,7 +1406,7 @@ function LinksPanel({ toast, onMutate }) {
           </div>
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={() => setShowAdd(false)}>Cancel</button>
-            <button className="btn btn-primary" onClick={addLink} disabled={saving || !slug || !target || !slugOk || !targetOk}>
+            <button className="btn btn-primary" onClick={addLink} disabled={saving || !slug || !target || !slugOk || !targetOk || slugTaken}>
               {saving ? 'Creating…' : 'Create Link'}
             </button>
           </div>
@@ -1430,7 +1440,8 @@ function LinksPanel({ toast, onMutate }) {
           </div>
           <div className="modal-footer">
             <button className="btn btn-ghost" onClick={() => setEditItem(null)}>Cancel</button>
-            <button className="btn btn-primary" onClick={saveEdit} disabled={saving || !editTarget || !targetUrlOk(editTarget)}>
+            <button className="btn btn-primary" onClick={saveEdit} disabled={saving || !editTarget || !targetUrlOk(editTarget) || editUnchanged}
+              title={editUnchanged ? 'Nothing has changed' : undefined}>
               {saving ? 'Saving…' : 'Save'}
             </button>
           </div>
@@ -1726,7 +1737,7 @@ function ServicesPanel({ toast, onMutate }) {
     if (!form.subdomain || !form.forward_host || !form.forward_port) return;
     setAddError('');
     if (!validateSubdomain(form.subdomain)) {
-      setAddError('Subdomain must be lowercase letters, numbers, and hyphens only');
+      setAddError('Subdomain must be 1-63 lowercase letters, numbers or hyphens, and cannot start or end with a hyphen');
       return;
     }
     if (!validatePort(form.forward_port)) {
