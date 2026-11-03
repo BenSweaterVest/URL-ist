@@ -623,14 +623,41 @@ def test_configured_without_password_stays_in_setup_mode(
     assert client.post("/api/auth/login", json={"password": "longenough12"}).status_code == 200
 
 
-def test_session_secret_status_reports_key_in_use(configured_client: TestClient) -> None:
-    """After the wizard writes a key to disk the process is still on its runtime key."""
+def test_session_key_from_wizard_applies_without_restart(
+    configured_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The key the wizard writes is used straight away; no restart reminder is needed."""
+    monkeypatch.delenv("SESSION_SECRET", raising=False)
     data = configured_client.get("/api/health").json()
-    assert data["session_secret_source"] == main_module._ACTIVE_SESSION_SECRET_SOURCE
-    if main_module._ACTIVE_SESSION_SECRET_SOURCE == "runtime":
-        assert data["session_secret_restart_needed"] is True
-    status = configured_client.get("/api/auth/status").json()
-    assert status["session_secret_restart_needed"] == data["session_secret_restart_needed"]
+    assert data["session_secret_source"] == "file"
+    assert data["session_secret_restart_needed"] is False
+    # The session started after the save is signed with the persisted key and keeps working.
+    assert configured_client.get("/api/auth/status").json()["authenticated"] is True
+    assert configured_client.get("/api/activity").status_code == 200
+
+
+def test_password_change_signs_out_other_sessions(
+    configured_client: TestClient, csrf_headers: dict[str, str]
+) -> None:
+    other = TestClient(main_module.app)
+    assert other.post("/api/auth/login", json={"password": "testpass1234"}).status_code == 200
+    assert other.get("/api/activity").status_code == 200
+
+    r = configured_client.post(
+        "/api/config",
+        json=_base_config(
+            console_password="brandnewpass99", console_password_confirm="brandnewpass99"
+        ),
+        headers=csrf_headers,
+    )
+    assert r.status_code == 200, r.text
+
+    # The browser that changed the password stays signed in; the other one does not.
+    assert configured_client.get("/api/activity").status_code == 200
+    assert other.get("/api/activity").status_code == 401
+    assert other.get("/api/auth/status").json()["authenticated"] is False
+    assert other.post("/api/auth/login", json={"password": "testpass1234"}).status_code == 401
+    assert other.post("/api/auth/login", json={"password": "brandnewpass99"}).status_code == 200
 
 
 def test_activity_log_trim_is_fast(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> None:
@@ -894,3 +921,21 @@ def test_create_link_reports_pending_when_status_read_fails(
     )
     assert r.status_code == 201, r.text
     assert r.json()["pending"] is True
+
+
+def test_masked_secrets_reveal_little_and_round_trip(
+    configured_client: TestClient, csrf_headers: dict[str, str]
+) -> None:
+    data = configured_client.get("/api/config").json()
+    # Short secrets (the NPM password) reveal nothing.
+    assert data["npm_password"] == main_module.MASK_CHAR * 8
+    assert "npm" not in data["npm_password"]
+    long_token = "cfat_" + "x" * 30 + "WXYZ"
+    assert main_module._mask(long_token) == main_module.MASK_CHAR * 8 + "WXYZ"
+
+    # Sending masked values back keeps the stored credentials.
+    body = _base_config(cf_api_token=data["cf_api_token"], npm_password=data["npm_password"])
+    r = configured_client.post("/api/config", json=body, headers=csrf_headers)
+    assert r.status_code == 200, r.text
+    assert main_module.config.npm_password == "npmsecret"
+    assert main_module.config.cf_api_token == "cfat_test"

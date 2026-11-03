@@ -48,7 +48,7 @@
 
   /* ── Tabs ── */
   .tabs { display: flex; align-items: flex-end; gap: 2px; padding: 0 24px; border-bottom: 1px solid var(--border); background: var(--surface); flex-shrink: 0; }
-  .tab { padding: 10px 18px 9px; cursor: pointer; font-size: 12px; font-weight: 500; color: var(--text-3); border-bottom: 2px solid transparent; transition: color 0.15s, border-color 0.15s; letter-spacing: 0.04em; text-transform: uppercase; user-select: none; }
+  .tab { background: none; border: none; border-bottom: 2px solid transparent; font-family: inherit; padding: 10px 18px 9px; cursor: pointer; font-size: 12px; font-weight: 500; color: var(--text-3); border-bottom: 2px solid transparent; transition: color 0.15s, border-color 0.15s; letter-spacing: 0.04em; text-transform: uppercase; user-select: none; }
   .tab:hover { color: var(--text-2); }
   .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
   .tab-count { display: inline-flex; align-items: center; justify-content: center; background: var(--border2); color: var(--text-2); font-size: 10px; font-family: var(--mono); min-width: 16px; height: 16px; border-radius: 8px; padding: 0 4px; margin-left: 6px; vertical-align: 1px; }
@@ -214,7 +214,7 @@
   integrity="sha384-BcI7nduYchENm39cFMEVJXHEE7fwHONANyn/pY2YTa+BNtrWF2bKBZeI0wqVithi"
   crossorigin="anonymous"></script>
 <script type="text/babel">
-const { useState, useEffect, useCallback } = React;
+const { useState, useEffect, useCallback, useRef } = React;
 
 // ── API wrapper ───────────────────────────────────────────────────────────────
 // All calls go to relative paths so the frontend and backend share an origin.
@@ -222,6 +222,19 @@ const { useState, useEffect, useCallback } = React;
 // Error objects with actionable messages.
 
 let CSRF_TOKEN = '';
+
+// Set by <App>. Called when an API call answers 401 so an expired session (or
+// a password change in another browser) returns to the login screen instead
+// of failing every action with "Not authenticated".
+let onSessionExpired = null;
+
+async function refreshCsrfToken() {
+  try {
+    const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
+    const s = await r.json();
+    CSRF_TOKEN = s.csrf_token || '';
+  } catch { /* ignore: the next unsafe request will report the problem */ }
+}
 
 const configTestPayload = (form) => ({
   cf_api_token:  form.cf_api_token,
@@ -252,6 +265,9 @@ const api = async (method, path, body) => {
   } catch (e) {
     throw new Error(`Network error — is the backend running? (${e.message})`);
   }
+  if (r.status === 401 && !path.startsWith('/api/auth/') && onSessionExpired) {
+    onSessionExpired();
+  }
   if (!r.ok) {
     const data = await r.json().catch(() => ({ detail: r.statusText }));
     // FastAPI validation errors (422) return detail as an array of {msg, loc, type}.
@@ -269,7 +285,8 @@ function validateSlug(s) {
 }
 function validateSubdomain(s) {
   const v = (s || '').trim().toLowerCase();
-  return /^[a-z0-9][a-z0-9\-]*$/.test(v);
+  // One DNS label, same rule as the backend: 1-63 chars, no leading/trailing hyphen.
+  return /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(v);
 }
 function validatePort(p) {
   const n = Number(p);
@@ -549,14 +566,11 @@ function ConfirmDialog({ title, message, confirmLabel, danger, requireText, onCo
   );
 }
 
-function GettingStartedBanner({ listExists, restartNeeded }) {
+function GettingStartedBanner({ listExists }) {
   const [dismissed, setDismissed] = useState(() => {
     try { return localStorage.getItem(SETUP_BANNER_KEY) === '1'; } catch { return false; }
   });
   if (dismissed) return null;
-  // restartNeeded comes from the backend: the process is still signing cookies
-  // with a temporary key even though a persistent one has been saved.
-  const needsRestart = !!restartNeeded;
   const dismiss = () => {
     try { localStorage.setItem(SETUP_BANNER_KEY, '1'); } catch { /* ignore */ }
     setDismissed(true);
@@ -565,17 +579,8 @@ function GettingStartedBanner({ listExists, restartNeeded }) {
     <div className="getting-started">
       <div>
         <div className="getting-started-title">Getting started</div>
-        {needsRestart && (
-          <div className="quota-banner" style={{ marginTop: '10px', marginBottom: 0 }}>
-            Session cookies are signed with a temporary key. Restart once so login persists across container restarts:
-            <span className="mono"> docker compose restart</span>
-          </div>
-        )}
         <ol>
           <li className="done">Complete the setup wizard and sign in</li>
-          <li className={!needsRestart ? 'done' : ''}>
-            Restart the container once after first save (<span className="mono">docker compose restart</span>) so sessions persist
-          </li>
           <li className={listExists ? 'done' : ''}>Run Tofu once for short links (<span className="mono">cd tofu &amp;&amp; tofu apply</span>)</li>
           <li>Optional: set Dockge, Uptime Kuma, Homepage, and Wiki URLs in Settings for the post-create homelab checklist</li>
         </ol>
@@ -841,12 +846,7 @@ function LoginScreen({ onAuthed, toast }) {
     setBusy(true);
     try {
       await api('POST', '/api/auth/login', { password });
-      // Refresh CSRF token for subsequent unsafe requests
-      try {
-        const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
-        const s = await r.json();
-        CSRF_TOKEN = s.csrf_token || '';
-      } catch { /* ignore */ }
+      await refreshCsrfToken();
       onAuthed();
     } catch (e) {
       toast(e.message, 'err');
@@ -973,17 +973,8 @@ function WizardScreen({ onComplete, toast, status }) {
         // A new password was chosen (first run, or a change): start a session with it.
         await api('POST', '/api/auth/login', { password: form.console_password });
       }
-      let restartNeeded = false;
-      try {
-        const r = await fetch('/api/auth/status', { credentials: 'same-origin' });
-        const s = await r.json();
-        CSRF_TOKEN = s.csrf_token || '';
-        restartNeeded = !!s.session_secret_restart_needed;
-      } catch { /* ignore */ }
-      toast(reopened ? 'Settings saved' : 'Configuration saved — welcome to URLer!', 'ok');
-      if (restartNeeded) {
-        toast('Tip: restart the container once so login sessions survive restarts.', 'ok');
-      }
+      await refreshCsrfToken();
+      toast(reopened ? 'Settings saved' : 'Configuration saved. Welcome to URLer!', 'ok');
       onComplete();
     } catch (e) {
       toast(e.message, 'err');
@@ -2293,15 +2284,25 @@ function ActivityPanel({ toast }) {
 //   'wizard'   → not configured; shows WizardScreen (full page, no tabs)
 //   'ready'    → configured; shows main app with header/tabs/panels
 
+const TAB_IDS = ['links', 'dns', 'services', 'activity'];
+
 function App() {
   const [appState, setAppState]     = useState('loading');
-  const [tab, setTab]               = useState('links');
+  const [tab, setTab]               = useState(() => {
+    const h = (window.location.hash || '').replace('#', '');
+    return TAB_IDS.includes(h) ? h : 'links';
+  });
+  const selectTab = (id) => {
+    setTab(id);
+    try { history.replaceState(null, '', `#${id}`); } catch { /* ignore */ }
+  };
   const [counts, setCounts]         = useState({ links: null, dns: null, services: null });
   const [showSettings, setShowSettings] = useState(false);
   const [linksListExists, setLinksListExists] = useState(false);
-  const [restartNeeded, setRestartNeeded] = useState(false);
   const [authStatus, setAuthStatus] = useState(null);
   const { toasts, add: toast }      = useToast();
+  const appStateRef = useRef(appState);
+  appStateRef.current = appState;
 
   // Order matters: login comes before the wizard. A half-configured install that
   // already has a password must not show the (prefilled) wizard to anyone who
@@ -2312,7 +2313,6 @@ function App() {
       const s = await r.json();
       CSRF_TOKEN = s.csrf_token || '';
       setAuthStatus(s);
-      setRestartNeeded(!!s.session_secret_restart_needed);
       if (s.login_required && !s.authenticated) {
         setAppState('login');
         return;
@@ -2328,6 +2328,16 @@ function App() {
   }, []);
 
   useEffect(() => { boot(); }, [boot]);
+
+  useEffect(() => {
+    onSessionExpired = () => {
+      if (appStateRef.current !== 'ready') return;
+      CSRF_TOKEN = '';
+      toast('Your session ended. Sign in again to continue.', 'err');
+      setAppState('login');
+    };
+    return () => { onSessionExpired = null; };
+  }, [toast]);
 
   // Fetch tab badge counts in parallel.  Uses allSettled so one failure
   // doesn't suppress the others (e.g. CF down but NPM still accessible).
@@ -2409,16 +2419,17 @@ function App() {
         <button className="gear-btn" onClick={() => setShowSettings(true)} title="Settings">⚙</button>
       </header>
 
-      <nav className="tabs">
+      <nav className="tabs" role="tablist">
         {TABS.map(t => (
-          <div key={t.id} className={`tab ${tab === t.id ? 'active' : ''}`} onClick={() => setTab(t.id)}>
+          <button key={t.id} type="button" role="tab" aria-selected={tab === t.id}
+            className={`tab ${tab === t.id ? 'active' : ''}`} onClick={() => selectTab(t.id)}>
             {t.label}
             {t.count !== null && <span className="tab-count">{t.count}</span>}
-          </div>
+          </button>
         ))}
       </nav>
 
-      <GettingStartedBanner listExists={linksListExists} restartNeeded={restartNeeded} />
+      <GettingStartedBanner listExists={linksListExists} />
 
       <main className="main">
         {/* Each panel mounts on tab activation and unmounts on switch,

@@ -71,6 +71,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+import itsdangerous
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -380,52 +381,62 @@ def _verify_console_password(password: str, stored: str) -> bool:
 
 
 def _session_secret_sources() -> tuple[str, str]:
-    """Return (secret, source) where source is 'env', 'file', or 'runtime'."""
+    """Return (secret, source) where source is 'env', 'file', or 'runtime'.
+
+    Reads the in-memory config, which _load_config() refreshes whenever
+    config.json is written, so a key saved by the wizard takes effect on the
+    next request without a restart.
+    """
     env = os.environ.get("SESSION_SECRET", "").strip()
     if len(env) >= 16:
         return env, "env"
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text())
-            fs = str(data.get("session_secret", "")).strip()
-            if len(fs) >= 16:
-                return fs, "file"
-        except (OSError, json.JSONDecodeError, TypeError):
-            pass
+    fs = (config.session_secret or "").strip()
+    if len(fs) >= 16:
+        return fs, "file"
     return _RUNTIME_SESSION_SECRET, "runtime"
 
 
-# Captured once at import because SessionMiddleware reads its key when the app is
-# built and never again. Status endpoints report this value instead of re-reading
-# disk; otherwise they would claim "file" the moment the wizard persists a key
-# that the running middleware has never loaded.
-_ACTIVE_SESSION_SECRET, _ACTIVE_SESSION_SECRET_SOURCE = _session_secret_sources()
-
-
 def _session_secret() -> str:
-    """Secret for SessionMiddleware, resolved at import (env, then config.json, then runtime)."""
-    if _ACTIVE_SESSION_SECRET_SOURCE == "runtime":
-        logger.warning(
-            "SESSION_SECRET is not set (or too short) and no session_secret in config.json — "
-            "using a per-process random session key (sessions will reset on restart). "
-            "Complete the wizard to persist session_secret or set SESSION_SECRET."
-        )
-    return _ACTIVE_SESSION_SECRET
+    """Current key for signing session cookies (env, then config.json, then runtime)."""
+    return _session_secret_sources()[0]
 
 
 def _session_secret_status() -> dict[str, Any]:
-    """Describe the session key actually in use and whether a restart would change it.
+    """Describe the session key in use.
 
-    session_secret_restart_needed is true when the process runs on a temporary key
-    but a persistent one now exists on disk or in the environment. The UI uses it
-    to keep the "restart once" reminder visible until the restart happens.
+    session_secret_restart_needed is kept for API compatibility. It is always
+    false now that the signing key follows config.json without a restart.
     """
-    _, persisted = _session_secret_sources()
-    active = _ACTIVE_SESSION_SECRET_SOURCE
     return {
-        "session_secret_source": active,
-        "session_secret_restart_needed": active == "runtime" and persisted != "runtime",
+        "session_secret_source": _session_secret_sources()[1],
+        "session_secret_restart_needed": False,
     }
+
+
+class _ReloadableSessionMiddleware(SessionMiddleware):
+    """SessionMiddleware whose signing key follows the current configuration.
+
+    Starlette builds its signer once in __init__. Exposing ``signer`` as a
+    property lets a key written by the setup wizard apply on the next request.
+    Cookies signed with the previous key simply stop validating, which only
+    happens on first setup (temporary key to persisted key) or a manual rotation.
+    """
+
+    _cached_key: str = ""
+    _cached_signer: itsdangerous.TimestampSigner | None = None
+
+    @property
+    def signer(self) -> itsdangerous.TimestampSigner:
+        key = _session_secret()
+        if self._cached_signer is None or key != self._cached_key:
+            self._cached_key = key
+            self._cached_signer = itsdangerous.TimestampSigner(key)
+        return self._cached_signer
+
+    @signer.setter
+    def signer(self, _value: itsdangerous.TimestampSigner) -> None:
+        # Starlette assigns a signer in __init__; the property supersedes it.
+        self._cached_signer = None
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -668,10 +679,29 @@ def _setup_complete() -> bool:
     return config.is_configured() and _console_password_set()
 
 
+def _auth_version() -> str:
+    """Short fingerprint of the current console password.
+
+    Stored in the session at login. Changing the password changes the
+    fingerprint, which signs out every other browser without a server-side
+    session store.
+    """
+    basis = config.console_password_hash or ("env:" if _console_password_env else "")
+    return hashlib.sha256(basis.encode()).hexdigest()[:16]
+
+
+def _start_session(request: Request) -> None:
+    request.session["authenticated"] = True
+    request.session["auth_ver"] = _auth_version()
+    _csrf_token(request)  # ensure token exists for subsequent unsafe requests
+
+
 def _session_authenticated(request: Request) -> bool:
     if not _login_required():
         return True
-    return bool(request.session.get("authenticated"))
+    if not request.session.get("authenticated"):
+        return False
+    return request.session.get("auth_ver") == _auth_version()
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -692,6 +722,7 @@ class Config:
     short_domain: str = ""
     cf_list_name: str = "shortlinks"
     console_password_hash: str = ""
+    session_secret: str = ""
     dns_target_ip: str = ""
     uptime_kuma_url: str = ""
     homepage_url: str = ""
@@ -847,6 +878,9 @@ def _load_config() -> None:
         short_domain=_get("short_domain", ""),
         cf_list_name=_get("cf_list_name", "shortlinks"),
         console_password_hash=_get("console_password_hash", ""),
+        # Read from the file only: SESSION_SECRET in the environment is handled
+        # separately and always wins (see _session_secret_sources).
+        session_secret=str(file_data.get("session_secret") or ""),
         dns_target_ip=_get("dns_target_ip", ""),
         uptime_kuma_url=_get("uptime_kuma_url", ""),
         homepage_url=_get("homepage_url", ""),
@@ -883,32 +917,28 @@ def _config_to_dict() -> dict[str, Any]:
 
 
 def _mask(value: str) -> str:
-    """Return a masked representation of a sensitive string.
+    """Return a masked stand-in for a stored secret.
 
-    Shows the first and last 4 characters; replaces the middle with bullets.
-    Used in GET /api/config so the frontend can display 'something is set'
-    without exposing the actual credential.
+    The frontend only needs to know that something is set. Long API tokens keep
+    their last four characters so an operator can tell which token is in use;
+    shorter values such as passwords reveal nothing, not even their length.
     """
     if not value:
         return ""
-    if len(value) <= 8:
-        return MASK_CHAR * len(value)
-    return value[:4] + MASK_CHAR * (len(value) - 8) + value[-4:]
+    if len(value) >= 20:
+        return MASK_CHAR * 8 + value[-4:]
+    return MASK_CHAR * 8
 
 
 def _resolve(proposed: str, current: str) -> str:
     """Return the real credential to use, handling masked-but-unchanged values.
 
-    When the settings form is submitted, sensitive fields may contain the
-    masked display value from GET /api/config rather than the real credential.
-    If proposed is empty or equals the masked form of current, keep current.
-    Otherwise use proposed (the user entered a new value).
-
-    Used by both test_config (so testing from settings modal works with
-    pre-populated masked fields) and save_config (so resaving without
-    changing a credential does not overwrite it with its masked form).
+    When the settings form is submitted, sensitive fields may still hold the
+    masked display value from GET /api/config. Any value containing MASK_CHAR
+    (or an empty value) means "unchanged" and keeps the stored credential; a
+    real token or password never contains that character.
     """
-    if not proposed or proposed == _mask(current):
+    if not proposed or MASK_CHAR in proposed:
         return current
     return proposed
 
@@ -925,6 +955,11 @@ async def lifespan(app: FastAPI):
     _cf_client = httpx.AsyncClient(timeout=10.0)
     _npm_client = httpx.AsyncClient(timeout=10.0)
     logger.info("URLer starting")
+    if _session_secret_sources()[1] == "runtime":
+        logger.warning(
+            "No SESSION_SECRET and no session_secret in config.json yet; using a temporary "
+            "session key until the setup wizard saves one."
+        )
     if config.is_configured():
         logger.info("  Domain:       %s", config.domain)
         logger.info("  Short domain: %s", config.short_domain)
@@ -1043,7 +1078,7 @@ async def add_request_id(request: Request, call_next):
 # Session must wrap HTTP middleware that uses request.session (Starlette stacks
 # add_middleware in reverse: last registered = outermost = runs first on request).
 app.add_middleware(
-    SessionMiddleware,
+    _ReloadableSessionMiddleware,
     secret_key=_session_secret(),
     max_age=14 * 24 * 3600,
     same_site=_session_cookie_same_site(),
@@ -1357,13 +1392,14 @@ async def auth_status(request: Request):
     login_required is true and the session is not authenticated, then the wizard
     when configured is false or console_password_set is false, otherwise the app.
     """
+    authed = _login_required() and _session_authenticated(request)
     return {
         "configured": config.is_configured(),
         "console_password_set": _console_password_set(),
         "missing_fields": config.missing_fields(),
-        "authenticated": bool(request.session.get("authenticated")),
+        "authenticated": authed,
         "login_required": _login_required(),
-        "csrf_token": _csrf_token(request) if request.session.get("authenticated") else "",
+        "csrf_token": _csrf_token(request) if authed else "",
         **_session_secret_status(),
     }
 
@@ -1404,8 +1440,7 @@ async def auth_login(request: Request, body: LoginBody):
     if not ok:
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    request.session["authenticated"] = True
-    _csrf_token(request)  # ensure token exists for subsequent unsafe requests
+    _start_session(request)
     return {"success": True}
 
 
@@ -1652,7 +1687,7 @@ async def test_config(proposal: ConfigTestProposal):
 
 
 @app.post("/api/config")
-async def save_config(proposal: ConfigProposal):
+async def save_config(proposal: ConfigProposal, request: Request):
     """Save configuration to CONFIG_FILE and reload the in-memory config.
 
     The app does not need to restart — config is applied immediately and all
@@ -1722,8 +1757,16 @@ async def save_config(proposal: ConfigProposal):
             "Ensure the /data volume is mounted (see compose.yaml).",
         ) from None
 
+    # A new password signs out other browsers (see _auth_version). The browser
+    # that made the change stays signed in if it already was.
+    if new_pw and request.session.get("authenticated"):
+        _start_session(request)
+
     logger.info("Configuration saved and reloaded")
-    emit_activity("config.updated", {"configured": config.is_configured()})
+    emit_activity(
+        "config.updated",
+        {"configured": config.is_configured(), "password_changed": bool(new_pw)},
+    )
     return {"success": True, "configured": config.is_configured()}
 
 
