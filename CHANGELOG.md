@@ -2,6 +2,33 @@
 
 Notable changes to URLer. Versions follow `__version__` in `main.py`.
 
+## 1.4.0
+
+Security
+
+- Starlette 0.49.1 had five published advisories (and failed the CI `pip-audit` step). Upgraded to FastAPI 0.162.0 and Starlette 1.10.0, with uvicorn 0.54.0 and pydantic 2.14.2.
+- Changing the console password signs out every other browser. Sessions carry a fingerprint of the password; the browser that made the change stays signed in.
+- `GET /api/config` no longer reveals the first and last four characters of secrets. Passwords show a fixed mask and long tokens only their last four characters.
+- Responses forbid framing and set `nosniff` and `Referrer-Policy: no-referrer`; API responses are not cached.
+
+Fixes
+
+- The session key written by the setup wizard is used from the next request. The "restart the container once" step, banner and toast are gone; `session_secret_restart_needed` is always `false`.
+- NPM requests re-authenticate once when NPM rejects a cached token instead of failing until the hourly refresh. NPM error bodies (`{"error": {"message": ...}}`) are shown as readable text.
+- Retrying a service whose earlier attempt left a DNS record behind now works: an A record already pointing at NPM is reused. A record pointing elsewhere, or an existing NPM host, is a 409 before anything is written. Rollback never deletes a record the call did not create.
+- Restoring a service from the trash keeps its NPM settings (locations, advanced config, HSTS, HTTP/2, caching, access list, certificate). Older trash entries still restore with defaults.
+- Short-link preflight accepts a proxied A, AAAA or CNAME record for the short domain.
+- Editing a short link without changes no longer deletes and recreates the Cloudflare list item.
+- Batch import flags subdomains listed twice and applies only the first.
+- DNS record names are validated (hostname labels, optional `*.` prefix, or `@`).
+- Tofu `short_subdomain` validation matches the DNS label rule.
+
+Added
+
+- Service create returns `proxy_host_id` and `dns_reused`.
+- Short-link delete events in the Activity log include the slug.
+- The SPA returns to the login screen when a session expires, remembers the active tab in the URL, uses real buttons for tabs, and warns about a duplicate slug before calling Cloudflare.
+
 ## 1.3.0
 
 Security

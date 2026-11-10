@@ -623,14 +623,41 @@ def test_configured_without_password_stays_in_setup_mode(
     assert client.post("/api/auth/login", json={"password": "longenough12"}).status_code == 200
 
 
-def test_session_secret_status_reports_key_in_use(configured_client: TestClient) -> None:
-    """After the wizard writes a key to disk the process is still on its runtime key."""
+def test_session_key_from_wizard_applies_without_restart(
+    configured_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The key the wizard writes is used straight away; no restart reminder is needed."""
+    monkeypatch.delenv("SESSION_SECRET", raising=False)
     data = configured_client.get("/api/health").json()
-    assert data["session_secret_source"] == main_module._ACTIVE_SESSION_SECRET_SOURCE
-    if main_module._ACTIVE_SESSION_SECRET_SOURCE == "runtime":
-        assert data["session_secret_restart_needed"] is True
-    status = configured_client.get("/api/auth/status").json()
-    assert status["session_secret_restart_needed"] == data["session_secret_restart_needed"]
+    assert data["session_secret_source"] == "file"
+    assert data["session_secret_restart_needed"] is False
+    # The session started after the save is signed with the persisted key and keeps working.
+    assert configured_client.get("/api/auth/status").json()["authenticated"] is True
+    assert configured_client.get("/api/activity").status_code == 200
+
+
+def test_password_change_signs_out_other_sessions(
+    configured_client: TestClient, csrf_headers: dict[str, str]
+) -> None:
+    other = TestClient(main_module.app)
+    assert other.post("/api/auth/login", json={"password": "testpass1234"}).status_code == 200
+    assert other.get("/api/activity").status_code == 200
+
+    r = configured_client.post(
+        "/api/config",
+        json=_base_config(
+            console_password="brandnewpass99", console_password_confirm="brandnewpass99"
+        ),
+        headers=csrf_headers,
+    )
+    assert r.status_code == 200, r.text
+
+    # The browser that changed the password stays signed in; the other one does not.
+    assert configured_client.get("/api/activity").status_code == 200
+    assert other.get("/api/activity").status_code == 401
+    assert other.get("/api/auth/status").json()["authenticated"] is False
+    assert other.post("/api/auth/login", json={"password": "testpass1234"}).status_code == 401
+    assert other.post("/api/auth/login", json={"password": "brandnewpass99"}).status_code == 200
 
 
 def test_activity_log_trim_is_fast(monkeypatch: pytest.MonkeyPatch, config_path: Path) -> None:
@@ -894,3 +921,340 @@ def test_create_link_reports_pending_when_status_read_fails(
     )
     assert r.status_code == 201, r.text
     assert r.json()["pending"] is True
+
+
+def test_masked_secrets_reveal_little_and_round_trip(
+    configured_client: TestClient, csrf_headers: dict[str, str]
+) -> None:
+    data = configured_client.get("/api/config").json()
+    # Short secrets (the NPM password) reveal nothing.
+    assert data["npm_password"] == main_module.MASK_CHAR * 8
+    assert "npm" not in data["npm_password"]
+    long_token = "cfat_" + "x" * 30 + "WXYZ"
+    assert main_module._mask(long_token) == main_module.MASK_CHAR * 8 + "WXYZ"
+
+    # Sending masked values back keeps the stored credentials.
+    body = _base_config(cf_api_token=data["cf_api_token"], npm_password=data["npm_password"])
+    r = configured_client.post("/api/config", json=body, headers=csrf_headers)
+    assert r.status_code == 200, r.text
+    assert main_module.config.npm_password == "npmsecret"
+    assert main_module.config.cf_api_token == "cfat_test"
+
+
+# ── Services: conflicts, DNS reuse, rollback, trash fidelity ─────────────────
+
+
+class _FakeBackends:
+    """In-memory Cloudflare DNS + NPM proxy hosts for service tests."""
+
+    def __init__(self) -> None:
+        self.dns: list[dict] = []
+        self.hosts: list[dict] = []
+        self.calls: list[tuple[str, str]] = []
+        self.npm_post_error: HTTPException | None = None
+
+    async def cf_request(self, method: str, path: str, **kwargs):
+        self.calls.append(("cf", f"{method} {path}"))
+        if method == "GET" and path.endswith("/dns_records"):
+            name = (kwargs.get("params") or {}).get("name")
+            rows = [r for r in self.dns if name is None or r["name"] == name]
+            return {"result": rows, "result_info": {"total_pages": 1}}
+        if method == "POST" and path.endswith("/dns_records"):
+            rec = {"id": f"{len(self.dns) + 1:032x}", **kwargs["json"]}
+            self.dns.append(rec)
+            return {"result": rec}
+        if method == "DELETE" and "/dns_records/" in path:
+            rid = path.rsplit("/", 1)[-1]
+            self.dns = [r for r in self.dns if r["id"] != rid]
+            return {"result": {"id": rid}}
+        raise AssertionError(f"unexpected CF call {method} {path}")
+
+    async def npm_request(self, method: str, path: str, **kwargs):
+        self.calls.append(("npm", f"{method} {path}"))
+        if method == "GET" and path == "/api/nginx/proxy-hosts":
+            return self.hosts
+        if method == "POST" and path == "/api/nginx/proxy-hosts":
+            if self.npm_post_error:
+                raise self.npm_post_error
+            host = {"id": len(self.hosts) + 1, **kwargs["json"]}
+            self.hosts.append(host)
+            return host
+        if method == "GET" and path.startswith("/api/nginx/proxy-hosts/"):
+            hid = int(path.rsplit("/", 1)[-1])
+            return next(h for h in self.hosts if h["id"] == hid)
+        if method == "DELETE" and path.startswith("/api/nginx/proxy-hosts/"):
+            hid = int(path.rsplit("/", 1)[-1])
+            self.hosts = [h for h in self.hosts if h["id"] != hid]
+            return True
+        raise AssertionError(f"unexpected NPM call {method} {path}")
+
+
+@pytest.fixture
+def backends(monkeypatch: pytest.MonkeyPatch) -> _FakeBackends:
+    fake = _FakeBackends()
+    monkeypatch.setattr(main_module, "cf_request", fake.cf_request)
+    monkeypatch.setattr(main_module, "npm_request", fake.npm_request)
+    return fake
+
+
+_SVC = {"subdomain": "app", "forward_host": "10.0.0.5", "forward_port": 8080}
+
+
+def test_create_service_conflicting_npm_host_writes_nothing(
+    configured_client: TestClient, csrf_headers: dict[str, str], backends: _FakeBackends
+) -> None:
+    backends.hosts.append({"id": 7, "domain_names": ["app.example.com"]})
+    r = configured_client.post("/api/services", json=_SVC, headers=csrf_headers)
+    assert r.status_code == 409
+    assert "already exists" in r.json()["detail"]
+    assert not any(c == ("cf", "POST /zones/" + "b" * 32 + "/dns_records") for c in backends.calls)
+    assert backends.dns == []
+
+
+def test_create_service_reuses_orphaned_dns_record_and_keeps_it_on_failure(
+    configured_client: TestClient, csrf_headers: dict[str, str], backends: _FakeBackends
+) -> None:
+    backends.dns.append({"id": "e" * 32, "name": "app.example.com", "content": "127.0.0.1"})
+    backends.npm_post_error = HTTPException(status_code=500, detail="NPM: boom")
+    r = configured_client.post("/api/services", json=_SVC, headers=csrf_headers)
+    assert r.status_code == 500
+    # The record existed before this call, so a failed NPM step must not delete it.
+    assert [d["id"] for d in backends.dns] == ["e" * 32]
+
+    backends.npm_post_error = None
+    r = configured_client.post("/api/services", json=_SVC, headers=csrf_headers)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    assert body["dns_reused"] is True
+    assert body["dns_id"] == "e" * 32
+    assert body["proxy_host_id"] == 1
+    assert len(backends.dns) == 1
+
+
+def test_create_service_rejects_dns_record_pointing_elsewhere(
+    configured_client: TestClient, csrf_headers: dict[str, str], backends: _FakeBackends
+) -> None:
+    backends.dns.append({"id": "e" * 32, "name": "app.example.com", "content": "203.0.113.4"})
+    r = configured_client.post("/api/services", json=_SVC, headers=csrf_headers)
+    assert r.status_code == 409
+    assert "203.0.113.4" in r.json()["detail"]
+    assert backends.hosts == []
+
+
+def test_create_service_rolls_back_dns_it_created(
+    configured_client: TestClient, csrf_headers: dict[str, str], backends: _FakeBackends
+) -> None:
+    backends.npm_post_error = HTTPException(status_code=500, detail="NPM: boom")
+    r = configured_client.post("/api/services", json=_SVC, headers=csrf_headers)
+    assert r.status_code == 500
+    assert backends.dns == []
+
+
+def test_trash_restore_keeps_custom_npm_settings(
+    configured_client: TestClient, csrf_headers: dict[str, str], backends: _FakeBackends
+) -> None:
+    backends.hosts.append(
+        {
+            "id": 3,
+            "domain_names": ["app.example.com"],
+            "forward_scheme": "https",
+            "forward_host": "10.0.0.5",
+            "forward_port": 8443,
+            "certificate_id": 2,
+            "ssl_forced": True,
+            "hsts_enabled": True,
+            "allow_websocket_upgrade": True,
+            "advanced_config": "client_max_body_size 0;\nproxy_ssl_verify off;",
+            "locations": [{"path": "/api", "forward_host": "10.0.0.6", "forward_port": 9000}],
+            "owner": {"id": 1},  # not restorable; must not be sent back
+        }
+    )
+    backends.dns.append({"id": "e" * 32, "name": "app.example.com", "content": "127.0.0.1"})
+
+    r = configured_client.post(
+        "/api/services/delete",
+        json={"proxy_host_id": 3, "domain": "app.example.com"},
+        headers=csrf_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["dns_deleted"] is True
+    entry = configured_client.get("/api/trash").json()["items"][0]
+
+    r = configured_client.post(f"/api/trash/{entry['id']}/restore", headers=csrf_headers)
+    assert r.status_code == 201, r.text
+    restored = backends.hosts[-1]
+    assert restored["advanced_config"].startswith("client_max_body_size 0;")
+    assert restored["locations"][0]["path"] == "/api"
+    assert restored["hsts_enabled"] is True
+    assert restored["forward_port"] == 8443
+    assert "owner" not in restored
+    assert configured_client.get("/api/trash").json()["items"] == []
+
+
+def test_batch_flags_and_skips_in_batch_duplicates(
+    configured_client: TestClient, csrf_headers: dict[str, str], backends: _FakeBackends
+) -> None:
+    items = [_SVC, {**_SVC, "forward_port": 9090}, {**_SVC, "subdomain": "other"}]
+    r = configured_client.post(
+        "/api/services/batch", json={"items": items, "dry_run": True}, headers=csrf_headers
+    )
+    assert r.status_code == 200
+    plan = r.json()["plan"]
+    assert plan[0]["warnings"] == []
+    assert "more than once" in plan[1]["warnings"][0]
+
+    r = configured_client.post(
+        "/api/services/batch",
+        json={"items": items, "dry_run": False, "continue_on_error": True},
+        headers=csrf_headers,
+    )
+    data = r.json()
+    assert [c["domain"] for c in data["created"]] == ["app.example.com", "other.example.com"]
+    assert data["failed"] == [
+        {"domain": "app.example.com", "error": "Duplicate entry in this batch", "status_code": 409}
+    ]
+
+
+def test_dns_create_validates_name(
+    configured_client: TestClient, csrf_headers: dict[str, str], backends: _FakeBackends
+) -> None:
+    for bad in ("bad name", "-x.example.com", "a..b", "x_y"):
+        r = configured_client.post("/api/dns", json={"name": bad}, headers=csrf_headers)
+        assert r.status_code == 422, bad
+    for good in ("svc", "svc.example.com.", "*.lab.example.com", "@"):
+        r = configured_client.post("/api/dns", json={"name": good}, headers=csrf_headers)
+        assert r.status_code == 201, (good, r.text)
+
+
+def test_delete_link_logs_slug(
+    configured_client: TestClient, csrf_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_get_list_id() -> str:
+        return "f" * 32
+
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        if method == "GET":
+            return {
+                "result": {
+                    "id": _LINK_ITEM_ID,
+                    "redirect": {"source_url": "https://s.example.com/ha"},
+                }
+            }
+        return {"result": {}}
+
+    monkeypatch.setattr(main_module, "get_list_id", fake_get_list_id)
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    r = configured_client.delete(f"/api/links/{_LINK_ITEM_ID}", headers=csrf_headers)
+    assert r.status_code == 200, r.text
+    ev = configured_client.get("/api/activity").json()["events"][0]
+    assert ev["action"] == "link.deleted"
+    assert ev["detail"]["slug"] == "ha"
+
+
+# ── NPM token handling ───────────────────────────────────────────────────────
+
+
+def test_npm_request_reauthenticates_once_on_401(
+    configured_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    import httpx
+
+    tokens_issued: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tokens":
+            tok = f"tok{len(tokens_issued) + 1}"
+            tokens_issued.append(tok)
+            return httpx.Response(200, json={"token": tok})
+        if request.headers["authorization"] == "Bearer tok1":
+            return httpx.Response(401, json={"error": {"code": 401, "message": "expired"}})
+        if request.url.path == "/api/nginx/proxy-hosts/9/enable":
+            return httpx.Response(
+                400, json={"error": {"code": 400, "message": "Host is already enabled"}}
+            )
+        return httpx.Response(200, json=[{"id": 1}])
+
+    async def run() -> None:
+        monkeypatch.setattr(
+            main_module, "_npm_client", httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        )
+        main_module._npm_token = None
+        assert await main_module.npm_request("GET", "/api/nginx/proxy-hosts") == [{"id": 1}]
+        assert tokens_issued == ["tok1", "tok2"]
+        # NPM's nested {"error": {"message": ...}} shape becomes a readable detail.
+        with pytest.raises(HTTPException) as exc:
+            await main_module.npm_request("POST", "/api/nginx/proxy-hosts/9/enable")
+        assert exc.value.detail == "NPM: Host is already enabled"
+
+    asyncio.run(run())
+    main_module._npm_token = None
+
+
+def test_security_headers(configured_client: TestClient) -> None:
+    for path in ("/", "/api/health", "/api/links-not-a-route"):
+        r = configured_client.get(path)
+        assert r.headers["x-frame-options"] == "DENY", path
+        assert r.headers["x-content-type-options"] == "nosniff"
+        assert r.headers["referrer-policy"] == "no-referrer"
+    assert configured_client.get("/api/health").headers["cache-control"] == "no-store"
+
+
+def test_preflight_accepts_proxied_cname(
+    monkeypatch: pytest.MonkeyPatch, configured_client: TestClient
+) -> None:
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        if path.endswith("/rules/lists"):
+            return {"result": [{"name": "shortlinks", "id": "abc123"}]}
+        if path.endswith("/dns_records"):
+            assert "type" not in kwargs.get("params", {})
+            return {
+                "result": [
+                    {"name": "short.example.com", "type": "TXT", "proxied": False},
+                    {"name": "short.example.com", "type": "CNAME", "proxied": True},
+                ]
+            }
+        return {"result": []}
+
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    main_module.config.short_domain = "short.example.com"
+    main_module._list_id_cache = None
+    payload = configured_client.get("/api/links/preflight").json()
+    assert payload["ready"] is True
+    assert payload["dns"]["proxied"] is True
+
+
+def test_update_link_without_changes_does_not_touch_cloudflare(
+    configured_client: TestClient, csrf_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writes: list[str] = []
+
+    async def fake_get_list_id() -> str:
+        return "f" * 32
+
+    async def fake_cf_request(method: str, path: str, **kwargs):  # noqa: ARG001
+        if method != "GET":
+            writes.append(method)
+        return {
+            "result": {
+                "id": _LINK_ITEM_ID,
+                "redirect": {
+                    "source_url": "https://s.example.com/ha",
+                    "target_url": "https://ha.example.com",
+                    "status_code": 302,
+                },
+            }
+        }
+
+    monkeypatch.setattr(main_module, "get_list_id", fake_get_list_id)
+    monkeypatch.setattr(main_module, "cf_request", fake_cf_request)
+    main_module.config.short_domain = "s.example.com"
+    r = configured_client.put(
+        f"/api/links/{_LINK_ITEM_ID}",
+        json={"target": " https://ha.example.com ", "status_code": 302},
+        headers=csrf_headers,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["unchanged"] is True
+    assert writes == []

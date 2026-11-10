@@ -96,8 +96,8 @@ variable "short_subdomain" {
   default     = "short"
 
   validation {
-    condition     = can(regex("^[a-z0-9][a-z0-9\\-]*$", var.short_subdomain))
-    error_message = "Subdomain must be lowercase alphanumeric and hyphens only."
+    condition     = can(regex("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", var.short_subdomain))
+    error_message = "Subdomain must be one DNS label: 1-63 lowercase letters, digits or hyphens, not starting or ending with a hyphen."
   }
 }
 

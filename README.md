@@ -56,11 +56,7 @@ docker compose up -d --build
 
 Open `http://<your-server-ip>:8099` — the **setup wizard** will guide you through choosing a **URLer password** (this app only — not your OS or NPM account), then your Cloudflare and NPM credentials. Settings are saved to a persistent Docker volume (`/data/config.json`) and applied immediately — no container restart needed.
 
-**After first setup:** Restart the container once so the session middleware uses the persisted `session_secret`:
-
-```bash
-docker compose restart
-```
+The wizard also writes a random `session_secret` to `config.json`; it is used from the next request on, so login sessions survive container restarts without any extra step.
 
 ### 2. Register URLer in NPM (optional but recommended)
 
@@ -139,7 +135,7 @@ Settings are saved to `/data/config.json` inside the container (persisted via Do
 | **Uptime Kuma URL** | Base URL of Uptime Kuma (optional; post-create link to `/add` monitor form) | Optional |
 | **Homepage URL** | Base URL of Homepage (optional; post-create copy-paste `services.yaml` snippet) | Optional |
 
-**Editing `config.json` directly:** The app reads settings at startup and when you save via the UI. If you edit `/data/config.json` by hand, restart the container so middleware and in-memory config pick up changes (especially `session_secret`).
+**Editing `config.json` directly:** The app reads settings at startup and when you save via the UI. If you edit `/data/config.json` by hand, restart the container so the in-memory config picks up the changes.
 
 **Config history:** Each save via Settings keeps a snapshot under `/data/config-versions/` (see Security section for retention).
 
@@ -164,7 +160,7 @@ Webhook JSON body: `{"event": "urler.reconcile", "unmatched_dns": <int>, "missin
 
 Reconcile events appear in the **Activity** tab only when drift is detected (non-zero counts).
 
-**Session signing:** `/api/health` and `/api/auth/status` include `session_secret_source` (`env`, `file`, or `runtime`) and `session_secret_restart_needed`. The source describes the key the running process is actually using, not what is on disk. Set **`SESSION_SECRET`** (≥16 characters) in `compose.yaml` for production, or let the wizard write `session_secret` to `config.json`. After the first wizard save the process is still on its temporary key, so `session_secret_restart_needed` is `true` and the getting-started banner asks you to **restart once**. The flag clears after the restart.
+**Session signing:** `/api/health` and `/api/auth/status` include `session_secret_source` (`env`, `file`, or `runtime`): the key currently signing cookies. Set **`SESSION_SECRET`** (≥16 characters) in `compose.yaml`, or let the wizard write `session_secret` to `config.json`; either takes effect immediately. `session_secret_restart_needed` is still reported for compatibility and is always `false` since 1.4.0.
 
 **NPM cert ID:** Must be **≥ 1** in Settings or `NPM_CERT_ID` env. A value of `0` marks the app as not fully configured and blocks service creation until corrected.
 
@@ -188,7 +184,9 @@ User visits short.example.com/ha
 
 New links use **302** (temporary redirect) so you can change a slug’s destination later; **301** is cached aggressively by browsers and makes edits invisible to repeat visitors. Existing list items keep their original status code when you edit them.
 
-The authenticated API **`GET /api/links/preflight`** returns whether the redirect list exists, whether the short-domain **proxied A** record looks correct, and a short list of human-readable issues (the Short Links tab uses this).
+The authenticated API **`GET /api/links/preflight`** returns whether the redirect list exists, whether the short domain has a **proxied** A, AAAA or CNAME record, and a short list of human-readable issues (the Short Links tab uses this).
+
+Editing a link replaces the list item (Cloudflare has no in-place edit), so the console skips the call entirely when nothing changed.
 
 Your home server is never contacted for short link redirects. The console only needs to be running when you *manage* (add/edit/delete) links — not for the redirects themselves.
 
@@ -209,11 +207,13 @@ Creates two things in sequence, with automatic DNS rollback if NPM fails:
 1. A Cloudflare A record: `subdomain.yourdomain.com → your-npm-ip`
 2. An NPM proxy host: `subdomain.yourdomain.com → scheme://backend-host:port` with your wildcard SSL cert
 
-**Delete** removes the NPM proxy host and matching DNS record (warns if one step fails). **Enable/disable** calls NPM's own enable and disable endpoints, so no other setting on the proxy host is touched. **Batch import** accepts JSON (`[{ "subdomain", "forward_host", "forward_port", ... }]`), supports dry-run preview, and optional continue-on-error.
+Before writing anything it checks for conflicts. An existing NPM proxy host for the name returns an error straight away. An existing A record that already points at NPM (usually left behind by an earlier failed attempt) is reused, so simply retrying works; an A record pointing anywhere else is reported as a conflict.
+
+**Delete** removes the NPM proxy host and matching DNS record (warns if one step fails). The trash keeps the host's full NPM settings (custom locations, advanced config, HSTS, HTTP/2, caching, access list), and **restore** recreates it with them. **Enable/disable** calls NPM's own enable and disable endpoints, so no other setting on the proxy host is touched. **Batch import** accepts JSON (`[{ "subdomain", "forward_host", "forward_port", ... }]`), supports dry-run preview, and optional continue-on-error.
 
 Subdomains must be a single DNS label: 1 to 63 lowercase letters, digits or hyphens, not starting or ending with a hyphen.
 
-If NPM proxy host creation fails, the DNS record is automatically rolled back. If you need to retry a partially-failed service creation, delete any orphaned DNS record from the DNS tab first.
+If NPM proxy host creation fails, a DNS record created by that attempt is rolled back. A record that existed before is left alone.
 
 In **Settings**, use **Auto-detect wildcard cert** (after the app is configured) to fill NPM Cert ID from NPM. The first-run wizard does not call this endpoint until setup is complete.
 
@@ -335,13 +335,17 @@ URLer manages your Cloudflare DNS and API credentials. Keep it internal.
 
 **Access control**: Do not expose port 8099 to the public internet. The app requires a **console password** and a **signed session cookie** for all API calls after setup. Still treat network access as part of your trust boundary: combine the password with LAN-only or VPN-only reachability, firewall rules, and a strong session signing key.
 
-**Session signing**: On first successful wizard save, a random **`session_secret`** is written into `config.json` (unless **`SESSION_SECRET`** is already set in the environment, ≥16 characters). If neither is present, the app uses a **per-process random** session key (secure, but sessions reset on restart). For stable sessions across restarts, set `SESSION_SECRET` in Compose or complete the wizard once and then restart so the middleware loads the persisted key.
+**Session signing**: On first successful wizard save, a random **`session_secret`** is written into `config.json` (unless **`SESSION_SECRET`** is already set in the environment, ≥16 characters) and used from the next request on. Until then the app signs with a **per-process random** key, which only matters before setup is finished.
 
 **HTTPS behind NPM**: When the browser only reaches the app over `https://`, set **`SESSION_COOKIE_HTTPS_ONLY=1`** in Compose so the session cookie is not sent on accidental `http://` hits.
 
 **Cookie settings**: By default the session cookie is **HttpOnly** (not accessible to JavaScript) and uses `SameSite=Lax`. You can set **`SESSION_COOKIE_SAMESITE=strict`** if you want stricter cross-site behavior.
 
-**Sign out does not revoke old cookies.** Sessions are signed cookies with no server-side record, so a cookie copied before sign-out stays valid until it expires (14 days). To invalidate every session at once, change `SESSION_SECRET` (or the `session_secret` in `config.json`) and restart.
+**Sign out does not revoke old cookies.** Sessions are signed cookies with no server-side record, so a cookie copied before sign-out stays valid until it expires (14 days). **Changing the console password signs out every other browser** (the one making the change stays signed in). To invalidate every session including your own, change `SESSION_SECRET` (or the `session_secret` in `config.json`) and restart.
+
+**Masked secrets**: Settings never sends stored secrets back to the browser. Passwords are shown as a fixed mask; long API tokens show only their last four characters. Leaving a masked field untouched keeps the stored value.
+
+**Security headers**: Every response forbids framing (`X-Frame-Options: DENY`, `frame-ancestors 'none'`) and sets `nosniff` and `Referrer-Policy: no-referrer`; API responses are `Cache-Control: no-store`.
 
 **CSRF protection**: All state-changing API requests require an `X-CSRF-Token` header (the SPA handles this automatically after login).
 

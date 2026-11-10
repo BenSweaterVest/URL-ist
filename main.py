@@ -34,7 +34,8 @@ Optional fields (env var names shown, built-in defaults listed):
                   NPM_URL; required when NPM_URL uses a hostname.
   CONFIG_FILE      Override path to config JSON           (/data/config.json)
   SESSION_SECRET   Key for signing login session cookies (>=16 chars). Optional if
-                   session_secret is stored in config.json (auto-generated on first save).
+                   session_secret is stored in config.json (auto-generated on first
+                   save and used from the next request, no restart needed).
   CONSOLE_PASSWORD Plaintext console password for env-only bootstrap; first login
                    persists a hash to config.json (see README). Without it (and with
                    no hash in config.json) the console stays in setup mode and only
@@ -71,6 +72,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+import itsdangerous
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -79,7 +81,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 logger = logging.getLogger("urler")
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 CF_BASE = "https://api.cloudflare.com/client/v4"
 MASK_CHAR = "•"  # used to mask secrets in GET /api/config responses
@@ -380,52 +382,62 @@ def _verify_console_password(password: str, stored: str) -> bool:
 
 
 def _session_secret_sources() -> tuple[str, str]:
-    """Return (secret, source) where source is 'env', 'file', or 'runtime'."""
+    """Return (secret, source) where source is 'env', 'file', or 'runtime'.
+
+    Reads the in-memory config, which _load_config() refreshes whenever
+    config.json is written, so a key saved by the wizard takes effect on the
+    next request without a restart.
+    """
     env = os.environ.get("SESSION_SECRET", "").strip()
     if len(env) >= 16:
         return env, "env"
-    if CONFIG_FILE.exists():
-        try:
-            data = json.loads(CONFIG_FILE.read_text())
-            fs = str(data.get("session_secret", "")).strip()
-            if len(fs) >= 16:
-                return fs, "file"
-        except (OSError, json.JSONDecodeError, TypeError):
-            pass
+    fs = (config.session_secret or "").strip()
+    if len(fs) >= 16:
+        return fs, "file"
     return _RUNTIME_SESSION_SECRET, "runtime"
 
 
-# Captured once at import because SessionMiddleware reads its key when the app is
-# built and never again. Status endpoints report this value instead of re-reading
-# disk; otherwise they would claim "file" the moment the wizard persists a key
-# that the running middleware has never loaded.
-_ACTIVE_SESSION_SECRET, _ACTIVE_SESSION_SECRET_SOURCE = _session_secret_sources()
-
-
 def _session_secret() -> str:
-    """Secret for SessionMiddleware, resolved at import (env, then config.json, then runtime)."""
-    if _ACTIVE_SESSION_SECRET_SOURCE == "runtime":
-        logger.warning(
-            "SESSION_SECRET is not set (or too short) and no session_secret in config.json — "
-            "using a per-process random session key (sessions will reset on restart). "
-            "Complete the wizard to persist session_secret or set SESSION_SECRET."
-        )
-    return _ACTIVE_SESSION_SECRET
+    """Current key for signing session cookies (env, then config.json, then runtime)."""
+    return _session_secret_sources()[0]
 
 
 def _session_secret_status() -> dict[str, Any]:
-    """Describe the session key actually in use and whether a restart would change it.
+    """Describe the session key in use.
 
-    session_secret_restart_needed is true when the process runs on a temporary key
-    but a persistent one now exists on disk or in the environment. The UI uses it
-    to keep the "restart once" reminder visible until the restart happens.
+    session_secret_restart_needed is kept for API compatibility. It is always
+    false now that the signing key follows config.json without a restart.
     """
-    _, persisted = _session_secret_sources()
-    active = _ACTIVE_SESSION_SECRET_SOURCE
     return {
-        "session_secret_source": active,
-        "session_secret_restart_needed": active == "runtime" and persisted != "runtime",
+        "session_secret_source": _session_secret_sources()[1],
+        "session_secret_restart_needed": False,
     }
+
+
+class _ReloadableSessionMiddleware(SessionMiddleware):
+    """SessionMiddleware whose signing key follows the current configuration.
+
+    Starlette builds its signer once in __init__. Exposing ``signer`` as a
+    property lets a key written by the setup wizard apply on the next request.
+    Cookies signed with the previous key simply stop validating, which only
+    happens on first setup (temporary key to persisted key) or a manual rotation.
+    """
+
+    _cached_key: str = ""
+    _cached_signer: itsdangerous.TimestampSigner | None = None
+
+    @property
+    def signer(self) -> itsdangerous.TimestampSigner:
+        key = _session_secret()
+        if self._cached_signer is None or key != self._cached_key:
+            self._cached_key = key
+            self._cached_signer = itsdangerous.TimestampSigner(key)
+        return self._cached_signer
+
+    @signer.setter
+    def signer(self, _value: itsdangerous.TimestampSigner) -> None:
+        # Starlette assigns a signer in __init__; the property supersedes it.
+        self._cached_signer = None
 
 
 def _env_int(name: str, default: int, minimum: int) -> int:
@@ -668,10 +680,29 @@ def _setup_complete() -> bool:
     return config.is_configured() and _console_password_set()
 
 
+def _auth_version() -> str:
+    """Short fingerprint of the current console password.
+
+    Stored in the session at login. Changing the password changes the
+    fingerprint, which signs out every other browser without a server-side
+    session store.
+    """
+    basis = config.console_password_hash or ("env:" if _console_password_env else "")
+    return hashlib.sha256(basis.encode()).hexdigest()[:16]
+
+
+def _start_session(request: Request) -> None:
+    request.session["authenticated"] = True
+    request.session["auth_ver"] = _auth_version()
+    _csrf_token(request)  # ensure token exists for subsequent unsafe requests
+
+
 def _session_authenticated(request: Request) -> bool:
     if not _login_required():
         return True
-    return bool(request.session.get("authenticated"))
+    if not request.session.get("authenticated"):
+        return False
+    return request.session.get("auth_ver") == _auth_version()
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -692,6 +723,7 @@ class Config:
     short_domain: str = ""
     cf_list_name: str = "shortlinks"
     console_password_hash: str = ""
+    session_secret: str = ""
     dns_target_ip: str = ""
     uptime_kuma_url: str = ""
     homepage_url: str = ""
@@ -847,6 +879,9 @@ def _load_config() -> None:
         short_domain=_get("short_domain", ""),
         cf_list_name=_get("cf_list_name", "shortlinks"),
         console_password_hash=_get("console_password_hash", ""),
+        # Read from the file only: SESSION_SECRET in the environment is handled
+        # separately and always wins (see _session_secret_sources).
+        session_secret=str(file_data.get("session_secret") or ""),
         dns_target_ip=_get("dns_target_ip", ""),
         uptime_kuma_url=_get("uptime_kuma_url", ""),
         homepage_url=_get("homepage_url", ""),
@@ -883,32 +918,28 @@ def _config_to_dict() -> dict[str, Any]:
 
 
 def _mask(value: str) -> str:
-    """Return a masked representation of a sensitive string.
+    """Return a masked stand-in for a stored secret.
 
-    Shows the first and last 4 characters; replaces the middle with bullets.
-    Used in GET /api/config so the frontend can display 'something is set'
-    without exposing the actual credential.
+    The frontend only needs to know that something is set. Long API tokens keep
+    their last four characters so an operator can tell which token is in use;
+    shorter values such as passwords reveal nothing, not even their length.
     """
     if not value:
         return ""
-    if len(value) <= 8:
-        return MASK_CHAR * len(value)
-    return value[:4] + MASK_CHAR * (len(value) - 8) + value[-4:]
+    if len(value) >= 20:
+        return MASK_CHAR * 8 + value[-4:]
+    return MASK_CHAR * 8
 
 
 def _resolve(proposed: str, current: str) -> str:
     """Return the real credential to use, handling masked-but-unchanged values.
 
-    When the settings form is submitted, sensitive fields may contain the
-    masked display value from GET /api/config rather than the real credential.
-    If proposed is empty or equals the masked form of current, keep current.
-    Otherwise use proposed (the user entered a new value).
-
-    Used by both test_config (so testing from settings modal works with
-    pre-populated masked fields) and save_config (so resaving without
-    changing a credential does not overwrite it with its masked form).
+    When the settings form is submitted, sensitive fields may still hold the
+    masked display value from GET /api/config. Any value containing MASK_CHAR
+    (or an empty value) means "unchanged" and keeps the stored credential; a
+    real token or password never contains that character.
     """
-    if not proposed or proposed == _mask(current):
+    if not proposed or MASK_CHAR in proposed:
         return current
     return proposed
 
@@ -925,6 +956,11 @@ async def lifespan(app: FastAPI):
     _cf_client = httpx.AsyncClient(timeout=10.0)
     _npm_client = httpx.AsyncClient(timeout=10.0)
     logger.info("URLer starting")
+    if _session_secret_sources()[1] == "runtime":
+        logger.warning(
+            "No SESSION_SECRET and no session_secret in config.json yet; using a temporary "
+            "session key until the setup wizard saves one."
+        )
     if config.is_configured():
         logger.info("  Domain:       %s", config.domain)
         logger.info("  Short domain: %s", config.short_domain)
@@ -1021,6 +1057,27 @@ async def security_gate(request: Request, call_next):
     return await call_next(request)
 
 
+_SECURITY_HEADERS = {
+    # The console holds Cloudflare and NPM credentials: never allow framing
+    # (clickjacking) and do not leak console URLs to integration links.
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Add defensive headers to every response; API responses are never cached."""
+    response = await call_next(request)
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    if request.url.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
+
+
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     """Propagate X-Request-ID for tracing; bump API request metrics."""
@@ -1043,7 +1100,7 @@ async def add_request_id(request: Request, call_next):
 # Session must wrap HTTP middleware that uses request.session (Starlette stacks
 # add_middleware in reverse: last registered = outermost = runs first on request).
 app.add_middleware(
-    SessionMiddleware,
+    _ReloadableSessionMiddleware,
     secret_key=_session_secret(),
     max_age=14 * 24 * 3600,
     same_site=_session_cookie_same_site(),
@@ -1277,33 +1334,47 @@ async def npm_request(method: str, path: str, **kwargs) -> Any:
     """Make an authenticated request to the Nginx Proxy Manager API.
 
     Acquires a token on first call (or after expiry) and wraps errors into
-    HTTPException with the actual NPM error message.
+    HTTPException with the actual NPM error message. A 401 on a cached token
+    (expired, or revoked by an NPM restart or password change) drops the cache
+    and retries once with a fresh token.
     """
-    token = await get_npm_token()
-    url = f"{config.npm_url.rstrip('/')}{path}"
+    global _npm_token, _npm_token_expires
     if not _npm_client:
         raise HTTPException(status_code=503, detail="HTTP client not initialized")
-    try:
-        r = await _npm_client.request(
-            method,
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            **kwargs,
-        )
-        r.raise_for_status()
-        return r.json()
-    except httpx.HTTPStatusError as e:
+    url = f"{config.npm_url.rstrip('/')}{path}"
+    for attempt in (1, 2):
+        token = await get_npm_token()
         try:
-            msg = e.response.json().get("error", e.response.text)
-        except Exception:
-            msg = e.response.text
-        logger.error("NPM %s %s → %s: %s", method, path, e.response.status_code, msg)
-        raise HTTPException(status_code=e.response.status_code, detail=f"NPM: {msg}") from None
-    except httpx.RequestError as e:
-        logger.error("NPM unreachable: %s", e)
-        raise HTTPException(
-            status_code=503, detail=f"Cannot reach NPM at {config.npm_url}: {str(e)}"
-        ) from None
+            r = await _npm_client.request(
+                method,
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                **kwargs,
+            )
+            if r.status_code == 401 and attempt == 1:
+                logger.info("NPM rejected cached token; re-authenticating")
+                _npm_token = None
+                _npm_token_expires = 0.0
+                continue
+            r.raise_for_status()
+            if not r.content:
+                return {}
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            try:
+                msg = e.response.json().get("error", e.response.text)
+                if isinstance(msg, dict):
+                    msg = msg.get("message") or json.dumps(msg)
+            except Exception:
+                msg = e.response.text
+            logger.error("NPM %s %s → %s: %s", method, path, e.response.status_code, msg)
+            raise HTTPException(status_code=e.response.status_code, detail=f"NPM: {msg}") from None
+        except httpx.RequestError as e:
+            logger.error("NPM unreachable: %s", e)
+            raise HTTPException(
+                status_code=503, detail=f"Cannot reach NPM at {config.npm_url}: {str(e)}"
+            ) from None
+    raise HTTPException(status_code=502, detail="NPM: authentication failed after retry")
 
 
 # ── Input validation helpers ───────────────────────────────────────────────────
@@ -1357,13 +1428,14 @@ async def auth_status(request: Request):
     login_required is true and the session is not authenticated, then the wizard
     when configured is false or console_password_set is false, otherwise the app.
     """
+    authed = _login_required() and _session_authenticated(request)
     return {
         "configured": config.is_configured(),
         "console_password_set": _console_password_set(),
         "missing_fields": config.missing_fields(),
-        "authenticated": bool(request.session.get("authenticated")),
+        "authenticated": authed,
         "login_required": _login_required(),
-        "csrf_token": _csrf_token(request) if request.session.get("authenticated") else "",
+        "csrf_token": _csrf_token(request) if authed else "",
         **_session_secret_status(),
     }
 
@@ -1404,8 +1476,7 @@ async def auth_login(request: Request, body: LoginBody):
     if not ok:
         raise HTTPException(status_code=401, detail="Invalid password")
 
-    request.session["authenticated"] = True
-    _csrf_token(request)  # ensure token exists for subsequent unsafe requests
+    _start_session(request)
     return {"success": True}
 
 
@@ -1652,7 +1723,7 @@ async def test_config(proposal: ConfigTestProposal):
 
 
 @app.post("/api/config")
-async def save_config(proposal: ConfigProposal):
+async def save_config(proposal: ConfigProposal, request: Request):
     """Save configuration to CONFIG_FILE and reload the in-memory config.
 
     The app does not need to restart — config is applied immediately and all
@@ -1722,8 +1793,16 @@ async def save_config(proposal: ConfigProposal):
             "Ensure the /data volume is mounted (see compose.yaml).",
         ) from None
 
+    # A new password signs out other browsers (see _auth_version). The browser
+    # that made the change stays signed in if it already was.
+    if new_pw and request.session.get("authenticated"):
+        _start_session(request)
+
     logger.info("Configuration saved and reloaded")
-    emit_activity("config.updated", {"configured": config.is_configured()})
+    emit_activity(
+        "config.updated",
+        {"configured": config.is_configured(), "password_changed": bool(new_pw)},
+    )
     return {"success": True, "configured": config.is_configured()}
 
 
@@ -1751,7 +1830,10 @@ async def list_links():
 
 @app.get("/api/links/preflight")
 async def short_links_preflight():
-    """Check short-link readiness: bulk redirect list + short-domain DNS (proxied A).
+    """Check short-link readiness: bulk redirect list + proxied short-domain DNS.
+
+    The short domain may be an A, AAAA or CNAME record; Tofu creates an A
+    record, but any proxied record lets Cloudflare apply bulk redirects.
 
     Intended for the Short Links tab and for operators scripting checks. Does not
     validate account-level ruleset presence (requires extra API scope); Tofu
@@ -1772,9 +1854,15 @@ async def short_links_preflight():
             data = await cf_request(
                 "GET",
                 f"/zones/{config.cf_zone_id}/dns_records",
-                params={"name": name, "type": "A", "per_page": 10},
+                params={"name": name, "per_page": 20},
             )
-            results = data.get("result", [])
+            results = [
+                r
+                for r in data.get("result", [])
+                if str(r.get("type") or "A").upper() in ("A", "AAAA", "CNAME")
+            ]
+            # Prefer a proxied record when several exist (e.g. A + AAAA).
+            results.sort(key=lambda r: r.get("proxied") is not True)
             if results:
                 rec = results[0]
                 dns_block["found"] = True
@@ -1782,13 +1870,13 @@ async def short_links_preflight():
                 dns_block["name"] = rec.get("name", name)
                 if rec.get("proxied") is False:
                     dns_block["hint"] = (
-                        "This A record should be proxied (orange cloud) so Cloudflare "
+                        "This record should be proxied (orange cloud) so Cloudflare "
                         "can intercept requests and apply bulk redirects at the edge."
                     )
             else:
                 dns_block["hint"] = (
-                    "No A record for this hostname in the zone — run Tofu bootstrap "
-                    "or add a proxied A record for the short domain."
+                    "No A, AAAA or CNAME record for this hostname in the zone — run Tofu "
+                    "bootstrap or add a proxied record for the short domain."
                 )
         except HTTPException as e:
             dns_block["hint"] = str(e.detail)
@@ -1803,7 +1891,7 @@ async def short_links_preflight():
             "Short Links Domain is not set — open Settings and set it to e.g. short.example.com."
         )
     elif dns_block["checked"] and not dns_block["found"]:
-        issues.append(f"No A record in this zone for {name}.")
+        issues.append(f"No A, AAAA or CNAME record in this zone for {name}.")
     elif dns_block["checked"] and dns_block["found"] and dns_block.get("proxied") is False:
         issues.append("Short domain exists but is DNS-only (grey cloud) — enable proxying.")
 
@@ -1951,14 +2039,24 @@ async def delete_link(item_id: str):
     list_id = await get_list_id()
     if not list_id:
         raise HTTPException(404, "Shortlink list not found")
+    # Read the item first so the activity log names the slug, not just an opaque ID.
+    source_url = ""
+    try:
+        existing = await _cf_get_list_item(list_id, item_id)
+        source_url = str((existing.get("redirect") or {}).get("source_url", ""))
+    except HTTPException as e:
+        if e.status_code == 404:
+            raise
+        logger.warning("Could not read short link %s before delete: %s", item_id, e.detail)
     data = await cf_request(
         "DELETE",
         f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items",
         json={"items": [{"id": item_id}]},
     )
     completed = await _cf_wait_list_operation(data, f"delete {item_id}")
-    logger.info("Deleted short link: %s", item_id)
-    emit_activity("link.deleted", {"item_id": item_id})
+    slug = (urlparse(source_url).path or "").strip("/") if source_url else ""
+    logger.info("Deleted short link: %s (%s)", slug or item_id, item_id)
+    emit_activity("link.deleted", {"item_id": item_id, "slug": slug, "source_url": source_url})
     return {"success": True, "pending": not completed}
 
 
@@ -1993,6 +2091,10 @@ async def update_link(item_id: str, payload: LinkUpdate):
     slug = path.split("/")[-1] if path else ""
     if not slug:
         raise HTTPException(status_code=400, detail="Could not resolve slug from source_url")
+
+    # Editing is delete + recreate, so skip it entirely when nothing changes.
+    if payload.target == old_target and status_code == _redirect_status_from_item(existing):
+        return {"success": True, "slug": slug, "pending": False, "unchanged": True}
 
     items_path = f"/accounts/{config.cf_account_id}/rules/lists/{list_id}/items"
 
@@ -2098,9 +2200,19 @@ class DNSCreate(BaseModel):
     @field_validator("name")
     @classmethod
     def validate_name(cls, v: str) -> str:
-        v = v.strip().lower()
+        v = v.strip().lower().rstrip(".")
         if not v:
             raise ValueError("Name cannot be empty")
+        if v == "@":
+            return v  # zone apex
+        labels = v.split(".")
+        if labels[0] == "*":
+            labels = labels[1:]  # wildcard record
+        if not labels or not all(_DNS_LABEL_RE.match(label) for label in labels):
+            raise ValueError(
+                "Name must be a hostname: labels of letters, digits and hyphens "
+                "(optionally starting with '*.')"
+            )
         return v
 
     @field_validator("content")
@@ -2435,52 +2547,35 @@ def _host_to_service_create(host: dict[str, Any], domain: str) -> ServiceCreate 
         return None
 
 
-@app.post("/api/services", status_code=201)
-async def create_service(svc: ServiceCreate):
-    """Create a new service: Cloudflare DNS A record + NPM proxy host in one operation.
+# NPM proxy-host fields carried through delete → trash → restore so a restored
+# host matches the deleted one (custom locations, advanced config, HSTS, ...).
+_NPM_HOST_RESTORE_FIELDS = (
+    "domain_names",
+    "forward_scheme",
+    "forward_host",
+    "forward_port",
+    "certificate_id",
+    "ssl_forced",
+    "hsts_enabled",
+    "hsts_subdomains",
+    "http2_support",
+    "block_exploits",
+    "caching_enabled",
+    "allow_websocket_upgrade",
+    "access_list_id",
+    "advanced_config",
+    "locations",
+)
 
-    DNS record:  {subdomain}.{domain}  A  {dns_target}  (routes to NPM)
-    NPM host:    {subdomain}.{domain}  →  {scheme}://{host}:{port}
 
-    Rollback: if NPM proxy host creation fails after DNS is created, the DNS
-    record is deleted before re-raising.  If rollback also fails, the orphaned
-    record ID is logged for manual cleanup in the Cloudflare dashboard.
+def _npm_host_restore_snapshot(host: dict[str, Any]) -> dict[str, Any]:
+    """Subset of an NPM proxy host that is safe and useful to send back on restore."""
+    return {k: host[k] for k in _NPM_HOST_RESTORE_FIELDS if k in host}
 
-    Retry: if a previous attempt left an orphaned DNS record, retrying will fail
-    at Step 1 with 'record already exists'.  Delete the orphaned record from the
-    DNS tab first, then retry here.
-    """
-    domain = f"{svc.subdomain}.{config.domain}"
-    dns_record_id: str | None = None
-    dns_target = config.dns_target
 
-    # Guard: Cloudflare only accepts an IPv4 address as A record content. A
-    # hostname in NPM URL without dns_target_ip would fail at Cloudflare with a
-    # less helpful message.
-    if not _is_ipv4(dns_target):
-        raise HTTPException(
-            status_code=400,
-            detail="No DNS target IP is configured. Use an IP address in the NPM URL or set "
-            "DNS target IP in Settings.",
-        )
-
-    # Step 1 — DNS A record pointing to NPM, not the backend directly.
-    # Traffic flows: browser → Cloudflare DNS → NPM → backend service.
-    # NPM handles TLS termination and proxying; the backend never exposes a port.
-    dns_data = await cf_request(
-        "POST",
-        f"/zones/{config.cf_zone_id}/dns_records",
-        json={"type": "A", "name": domain, "content": dns_target, "proxied": False, "ttl": 1},
-    )
-    result = dns_data.get("result") or {}
-    dns_record_id = result.get("id")
-    if not dns_record_id:
-        raise HTTPException(status_code=502, detail="Cloudflare returned success but no record ID")
-    logger.info("DNS record created: %s → %s (id=%s)", domain, dns_target, dns_record_id)
-
-    # Step 2 — NPM proxy host.  Roll back DNS on failure.
-    advanced_config = "proxy_ssl_verify off;" if svc.ssl_verify_off else ""
-    npm_payload = {
+def _service_npm_payload(svc: ServiceCreate, domain: str) -> dict[str, Any]:
+    """Default NPM proxy-host body for a new service."""
+    return {
         "domain_names": [domain],
         "forward_scheme": svc.forward_scheme,
         "forward_host": svc.forward_host,
@@ -2493,11 +2588,95 @@ async def create_service(svc: ServiceCreate):
         "http2_support": False,
         "meta": {},
         "locations": [],
-        "advanced_config": advanced_config,
+        "advanced_config": "proxy_ssl_verify off;" if svc.ssl_verify_off else "",
     }
+
+
+async def _find_dns_a_record(name: str) -> dict[str, Any] | None:
+    """Return the zone's A record with exactly this name, if any."""
+    data = await cf_request(
+        "GET",
+        f"/zones/{config.cf_zone_id}/dns_records",
+        params={"name": name, "type": "A", "per_page": 10},
+    )
+    results = data.get("result") if isinstance(data, dict) else None
+    for rec in results if isinstance(results, list) else []:
+        if str(rec.get("name", "")).lower() == name:
+            return rec
+    return None
+
+
+async def _create_service(
+    svc: ServiceCreate, npm_host_snapshot: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Create DNS + NPM proxy host. See create_service for the behaviour.
+
+    npm_host_snapshot, when given (trash restore), overrides the default proxy
+    host settings so the restored host matches the one that was deleted.
+    """
+    domain = f"{svc.subdomain}.{config.domain}"
+    dns_target = config.dns_target
+
+    # Guard: Cloudflare only accepts an IPv4 address as A record content. A
+    # hostname in NPM URL without dns_target_ip would fail at Cloudflare with a
+    # less helpful message.
+    if not _is_ipv4(dns_target):
+        raise HTTPException(
+            status_code=400,
+            detail="No DNS target IP is configured. Use an IP address in the NPM URL or set "
+            "DNS target IP in Settings.",
+        )
+
+    # Step 0 — conflicts. Checking NPM first means a duplicate never touches DNS.
+    npm_hosts = await npm_request("GET", "/api/nginx/proxy-hosts")
+    for host in npm_hosts if isinstance(npm_hosts, list) else []:
+        if domain in _npm_host_domain_names(host):
+            raise HTTPException(
+                status_code=409,
+                detail=f"An NPM proxy host for {domain} already exists (id {host.get('id')}).",
+            )
+
+    # Step 1 — DNS A record pointing to NPM, not the backend directly.
+    # Traffic flows: browser → Cloudflare DNS → NPM → backend service.
+    # A record left behind by an earlier failed attempt is reused when it already
+    # points at NPM; one pointing anywhere else is a real conflict.
+    existing = await _find_dns_a_record(domain)
+    dns_created = False
+    if existing:
+        if existing.get("content") != dns_target:
+            raise HTTPException(
+                status_code=409,
+                detail=f"A DNS record for {domain} already exists and points to "
+                f"{existing.get('content')}, not {dns_target}. Change or delete it first.",
+            )
+        dns_record_id = str(existing.get("id") or "")
+        logger.info("Reusing existing DNS record for %s (id=%s)", domain, dns_record_id)
+    else:
+        dns_data = await cf_request(
+            "POST",
+            f"/zones/{config.cf_zone_id}/dns_records",
+            json={"type": "A", "name": domain, "content": dns_target, "proxied": False, "ttl": 1},
+        )
+        result = dns_data.get("result") or {}
+        dns_record_id = str(result.get("id") or "")
+        if not dns_record_id:
+            raise HTTPException(
+                status_code=502, detail="Cloudflare returned success but no record ID"
+            )
+        dns_created = True
+        logger.info("DNS record created: %s → %s (id=%s)", domain, dns_target, dns_record_id)
+
+    # Step 2 — NPM proxy host.  Roll back a DNS record we created on failure.
+    npm_payload = _service_npm_payload(svc, domain)
+    if npm_host_snapshot:
+        npm_payload.update(_npm_host_restore_snapshot(npm_host_snapshot))
+        if domain not in [str(d).lower() for d in npm_payload.get("domain_names") or []]:
+            npm_payload["domain_names"] = [domain]
     try:
-        await npm_request("POST", "/api/nginx/proxy-hosts", json=npm_payload)
+        npm_host = await npm_request("POST", "/api/nginx/proxy-hosts", json=npm_payload)
     except HTTPException:
+        if not dns_created:
+            raise
         logger.warning(
             "NPM host creation failed for %s; rolling back DNS %s", domain, dns_record_id
         )
@@ -2513,26 +2692,38 @@ async def create_service(svc: ServiceCreate):
             )
         raise  # re-raise original NPM error to the frontend
 
-    logger.info(
-        "Service created: %s → %s://%s:%s",
-        domain,
-        svc.forward_scheme,
-        svc.forward_host,
-        svc.forward_port,
-    )
+    backend = f"{npm_payload['forward_scheme']}://{npm_payload['forward_host']}:{npm_payload['forward_port']}"
+    logger.info("Service created: %s → %s", domain, backend)
     emit_activity(
         "service.created",
-        {
-            "domain": domain,
-            "backend": f"{svc.forward_scheme}://{svc.forward_host}:{svc.forward_port}",
-        },
+        {"domain": domain, "backend": backend, "dns_reused": not dns_created},
     )
     return {
         "success": True,
         "domain": domain,
         "dns_id": dns_record_id,
-        "backend": f"{svc.forward_scheme}://{svc.forward_host}:{svc.forward_port}",
+        "dns_reused": not dns_created,
+        "proxy_host_id": npm_host.get("id") if isinstance(npm_host, dict) else None,
+        "backend": backend,
     }
+
+
+@app.post("/api/services", status_code=201)
+async def create_service(svc: ServiceCreate):
+    """Create a new service: Cloudflare DNS A record + NPM proxy host in one operation.
+
+    DNS record:  {subdomain}.{domain}  A  {dns_target}  (routes to NPM)
+    NPM host:    {subdomain}.{domain}  →  {scheme}://{host}:{port}
+
+    Conflicts: an existing NPM host for the domain is a 409 before anything is
+    written. An existing A record that already points at NPM (typically left by
+    an earlier failed attempt) is reused; one pointing elsewhere is a 409.
+
+    Rollback: if NPM proxy host creation fails after this call created the DNS
+    record, the record is deleted before re-raising. A reused record is left
+    alone. If rollback fails, the orphaned record ID is logged.
+    """
+    return await _create_service(svc)
 
 
 @app.post("/api/services/batch", status_code=200)
@@ -2552,13 +2743,19 @@ async def batch_services(payload: ServiceBatchRequest):
         existing_npm.update(_npm_host_domain_names(h))
 
     plan: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for item in payload.items:
         domain = f"{item.subdomain}.{config.domain}"
         warnings: list[str] = []
+        if domain in seen:
+            warnings.append("Listed more than once in this batch; only the first is applied")
+        seen.add(domain)
         if domain in existing_dns:
-            warnings.append("DNS record already exists")
+            warnings.append(
+                "DNS record already exists (reused if it points at NPM, otherwise this item fails)"
+            )
         if domain in existing_npm:
-            warnings.append("NPM proxy host already exists")
+            warnings.append("NPM proxy host already exists; this item will fail")
         plan.append(
             {
                 "domain": domain,
@@ -2572,9 +2769,19 @@ async def batch_services(payload: ServiceBatchRequest):
 
     created: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    applied: set[str] = set()
     for item in payload.items:
+        domain = f"{item.subdomain}.{config.domain}"
+        if domain in applied:
+            failed.append(
+                {"domain": domain, "error": "Duplicate entry in this batch", "status_code": 409}
+            )
+            if not payload.continue_on_error:
+                break
+            continue
+        applied.add(domain)
         try:
-            res = await create_service(item)
+            res = await _create_service(item)
             created.append(res)
         except HTTPException as e:
             failed.append(
@@ -2618,6 +2825,7 @@ async def delete_service(payload: ServiceDelete):
     dns_target_id = payload.dns_record_id
 
     restore_svc: ServiceCreate | None = None
+    host_dict: dict[str, Any] | None = None
     try:
         raw_h = await npm_request("GET", f"/api/nginx/proxy-hosts/{payload.proxy_host_id}")
         host_dict = _normalize_npm_host_payload(raw_h)
@@ -2664,6 +2872,7 @@ async def delete_service(payload: ServiceDelete):
                 "ts": datetime.now(UTC).isoformat(),
                 "domain": payload.domain,
                 "service": restore_svc.model_dump(),
+                "npm_host": _npm_host_restore_snapshot(host_dict or {}),
             }
         )
 
@@ -2845,7 +3054,8 @@ async def restore_trashed_service(entry_id: str):
         svc = ServiceCreate(**entry["service"])
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid trash payload: {e}") from e
-    await create_service(svc)
+    snapshot = entry.get("npm_host") if isinstance(entry.get("npm_host"), dict) else None
+    await _create_service(svc, npm_host_snapshot=snapshot)
     trash_remove(entry_id)
     emit_activity("service.restored_from_trash", {"domain": entry.get("domain")})
     return {"success": True}
